@@ -6,13 +6,20 @@ from tests.test_worker import StubBackend
 
 
 class VariedBackend(StubBackend):
-    """Embeds so that texts containing 'lease' land near the query vector."""
+    """Embeds the literal query 'lease' exactly on-axis, on-topic content
+    near but not exactly on it (so there's headroom under the 1.0 clamp
+    for the hybrid boost to show), and off-topic content far away."""
 
     def embed(self, texts):
         out = []
         for t in texts:
-            out.append([1.0, 0.0, 0.0, 0.0] if "lease" in t.lower()
-                       else [0.0, 1.0, 0.0, 0.0])
+            tl = t.lower()
+            if tl == "lease":
+                out.append([1.0, 0.0, 0.0, 0.0])
+            elif "lease" in tl:
+                out.append([0.95, 0.05, 0.0, 0.0])
+            else:
+                out.append([0.0, 1.0, 0.0, 0.0])
         return out
 
 
