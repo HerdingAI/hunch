@@ -34,7 +34,13 @@ dependencies = [
 [project.optional-dependencies]
 local = [
   "sentence-transformers>=5.0",
-  "transformers>=5.0",
+  # Pinned, not just floored: transformers 5.x's PretrainedConfig refactor
+  # breaks Florence-2's trust_remote_code config (AttributeError on
+  # forced_bos_token_id), while anything below 4.51 predates Qwen3 model
+  # support entirely. Verified empirically on this machine -- 4.49.0 and
+  # 4.57.6 each break one of the two required models; 4.51.3 is the
+  # narrow band that runs both.
+  "transformers==4.51.3",
   "torch>=2.2",
   "pillow>=10.0",
   "einops>=0.8",

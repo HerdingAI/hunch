@@ -1,0 +1,172 @@
+"""Everything in one Python process: no daemon, no server, no Ollama.
+
+Models load lazily and per stage. A 4 GB card cannot hold the embedder, the
+vision model and Whisper at once, so each is loaded when first needed and can
+be released when idle.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import os
+
+from ..config import Config
+from .base import Backend
+
+EMBED_CHARS = 8000          # keep inside the embedding model's context
+# Matches extract.FFMPEG_TIMEOUT: long recordings on CPU fallback are
+# legitimately slow, but a malformed container can also hang faster-whisper
+# indefinitely, so transcription needs the same bounded-wait treatment every
+# other risky format gets.
+TRANSCRIBE_TIMEOUT = 900
+
+
+def _device() -> str:
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:                              # noqa: BLE001
+        return "cpu"
+
+
+class LocalBackend(Backend):
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.model_id = cfg.embed_model
+        self.dim = cfg.embed_dim
+        self.device = _device()
+        # Tracked separately from self.device: ctranslate2 (faster-whisper's
+        # backend) links its own CUDA stack independent of torch's, so a
+        # library mismatch there (see transcribe()) must not force the
+        # embedder/vision model -- which use torch's CUDA and are unaffected
+        # -- onto CPU too.
+        self._whisper_device = self.device
+        self._embedder = None
+        self._vision = None
+        self._vision_proc = None
+        self._whisper = None
+
+    # --- embeddings -------------------------------------------------------
+    def _load_embedder(self):
+        if self._embedder is None:
+            from sentence_transformers import SentenceTransformer
+            self._embedder = SentenceTransformer(
+                self.cfg.embed_model, device=self.device,
+                truncate_dim=self.cfg.embed_dim)
+        return self._embedder
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        model = self._load_embedder()
+        clipped = [(t or "")[:EMBED_CHARS] for t in texts]
+        vecs = model.encode(clipped, batch_size=16, normalize_embeddings=True,
+                            show_progress_bar=False)
+        return [list(map(float, v)) for v in vecs]
+
+    # --- vision -----------------------------------------------------------
+    def _load_vision(self):
+        if self._vision is None:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoProcessor
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
+            self._vision = AutoModelForCausalLM.from_pretrained(
+                self.cfg.vision_model, torch_dtype=dtype,
+                trust_remote_code=True).to(self.device).eval()
+            self._vision_proc = AutoProcessor.from_pretrained(
+                self.cfg.vision_model, trust_remote_code=True)
+        return self._vision, self._vision_proc
+
+    def describe_image(self, path: str) -> tuple[str, str]:
+        try:
+            from PIL import Image
+            model, proc = self._load_vision()
+            image = Image.open(path).convert("RGB")
+            # Florence-2 is a task model: ask for a caption, get a caption --
+            # no conversational prose to strip.
+            task = "<DETAILED_CAPTION>"
+            inputs = proc(text=task, images=image, return_tensors="pt").to(self.device)
+            if self.device == "cuda":
+                inputs = {k: (v.half() if v.dtype.is_floating_point else v)
+                          for k, v in inputs.items()}
+            out = model.generate(**inputs, max_new_tokens=128, num_beams=1,
+                                 do_sample=False)
+            text = proc.batch_decode(out, skip_special_tokens=True)[0]
+            parsed = proc.post_process_generation(
+                text, task=task, image_size=image.size)
+            return str(parsed.get(task, text)).strip(), ""
+        except Exception as exc:                   # noqa: BLE001
+            return "", f"caption failed: {exc}"
+
+    # --- audio ------------------------------------------------------------
+    def _load_whisper(self):
+        if self._whisper is None:
+            from faster_whisper import WhisperModel
+            try:
+                self._whisper = WhisperModel(self.cfg.whisper_model,
+                                             device=self._whisper_device, compute_type="int8")
+            except Exception:                      # noqa: BLE001
+                # CUDA runtime libs missing is common; degraded beats broken.
+                # (Construction alone rarely raises this -- see transcribe()
+                # for the more common case where it surfaces later.)
+                self._whisper_device = "cpu"
+                self._whisper = WhisperModel(self.cfg.whisper_model,
+                                             device="cpu", compute_type="int8")
+        return self._whisper
+
+    def _transcribe_once(self, model, path: str) -> tuple[str, str]:
+        def _run():
+            segments, _info = model.transcribe(path, beam_size=1)
+            return " ".join(s.text for s in segments).strip()
+
+        # A thread with a deadline can't kill a stuck native call outright,
+        # but it unblocks the worker loop so one malformed file doesn't stall
+        # the whole budgeted run -- the model stays loaded for the next file
+        # either way. shutdown(wait=False) is deliberate: waiting here would
+        # block on the very hang this exists to escape.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(_run)
+        try:
+            text = future.result(timeout=TRANSCRIBE_TIMEOUT)
+            pool.shutdown(wait=False)
+            return text, ""
+        except concurrent.futures.TimeoutError:
+            pool.shutdown(wait=False)
+            return "", f"transcribe timeout after {TRANSCRIBE_TIMEOUT}s"
+        except Exception as exc:                   # noqa: BLE001
+            pool.shutdown(wait=False)
+            return "", f"transcribe failed: {exc}"
+
+    def transcribe(self, path: str) -> tuple[str, str]:
+        try:
+            model = self._load_whisper()
+        except Exception as exc:                   # noqa: BLE001
+            return "", f"transcribe failed: {exc}"
+
+        text, err = self._transcribe_once(model, path)
+        if err.startswith("transcribe failed") and self._whisper_device == "cuda":
+            # ctranslate2 links a CUDA stack independent of torch's and
+            # defers loading it past model construction to first inference
+            # -- unlike torch, which resolves its own bundled CUDA libs
+            # eagerly. A missing/mismatched libcublas (a common local-GPU
+            # misconfiguration, e.g. a CUDA-13 torch install alongside
+            # ctranslate2's CUDA-12 requirement) therefore surfaces here,
+            # not in _load_whisper()'s try/except, which never actually
+            # triggers for this -- the most common real case. Retry once on
+            # CPU rather than failing every file for the rest of the run;
+            # sticking to CPU afterward (no reset in release()) avoids
+            # repeating a load we now know fails.
+            self._whisper_device = "cpu"
+            self._whisper = None
+            try:
+                model = self._load_whisper()
+            except Exception as exc:               # noqa: BLE001
+                return "", f"transcribe failed: {exc}"
+            text, err = self._transcribe_once(model, path)
+        return text, err
+
+    def release(self) -> None:
+        self._embedder = self._vision = self._vision_proc = self._whisper = None
+        try:
+            import torch
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+        except Exception:                          # noqa: BLE001
+            pass
