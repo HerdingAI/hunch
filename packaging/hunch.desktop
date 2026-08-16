@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Hunch
+GenericName=Semantic file search
+Comment=Find your files by what they mean
+Exec=hunch gui
+Icon=system-search
+Terminal=false
+Categories=Utility;FileTools;
+Keywords=search;find;files;semantic;
+StartupNotify=true
