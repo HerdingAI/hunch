@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hunch-search"
+version = "0.1.0"
+description = "Find your files by what they mean, not what they are called."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Hunch contributors" }]
+keywords = ["search", "semantic", "files", "desktop", "gnome", "local"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications :: GTK",
+  "Intended Audience :: End Users/Desktop",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Desktop Environment :: File Managers",
+  "Topic :: Utilities",
+]
+
+# Core tier only. Media models are optional extras so a first install stays small.
+dependencies = [
+  "sqlite-vec>=0.1.9",
+  "numpy>=1.26",
+  "platformdirs>=4.0",
+  "keyring>=25.0",
+  "tomli-w>=1.0",
+]
+
+[project.optional-dependencies]
+local = [
+  "sentence-transformers>=5.0",
+  "transformers>=5.0",
+  "torch>=2.2",
+  "pillow>=10.0",
+  "einops>=0.8",
+  "timm>=1.0",
+]
+media = ["faster-whisper>=1.2"]
+gui = ["PyGObject>=3.46"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0"]
+
+[project.scripts]
+hunch = "hunch.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hunch-search/hunch"
+Issues = "https://github.com/hunch-search/hunch/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hunch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

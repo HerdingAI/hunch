@@ -1,0 +1,16 @@
+Hunch
+Copyright 2026 Hunch contributors
+
+Licensed under the Apache License, Version 2.0.
+
+This product downloads and uses the following models at runtime.
+They are not distributed with this software.
+
+  Florence-2-large        MIT           https://huggingface.co/microsoft/Florence-2-large
+  Qwen3-Embedding         Apache-2.0    https://huggingface.co/Qwen
+  SmolVLM-256M-Instruct   Apache-2.0    https://huggingface.co/HuggingFaceTB
+  faster-whisper models   MIT           https://github.com/SYSTRAN/faster-whisper
+
+This product bundles a derived extract of the GeoNames geographical database
+(src/hunch/data/cities.npz), used for offline reverse geocoding.
+GeoNames is licensed under CC BY 4.0 — https://www.geonames.org/
