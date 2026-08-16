@@ -1,0 +1,297 @@
+"""Command line entry point."""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+from datetime import date
+
+from . import budget as budget_mod
+from . import catalog, config, db, search as search_mod, worker
+from .backends import get_backend
+from .setup import install, probe
+
+PRUNE_TOMBSTONE_DAYS = 90
+
+
+def _open():
+    cfg = config.load_config()
+    conn = db.connect(config.db_path(), dim=cfg.embed_dim)
+    return conn, cfg
+
+
+def _human(n: int | None) -> str:
+    if not n:
+        return "?"
+    size = float(n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if size < 1024:
+            return f"{size:.0f}{unit}"
+        size /= 1024
+    return f"{size:.0f}P"
+
+
+def cmd_setup(args) -> int:
+    caps = probe.probe()
+    verdict = caps.verdict()
+    print("Checking your hardware…\n")
+    print(f"  GPU     {'yes, %d MB' % caps.vram_mb if caps.has_gpu else 'none detected'}")
+    print(f"  Memory  {caps.ram_mb} MB")
+    print(f"  Disk    {caps.free_disk_mb} MB free")
+    print(f"  CPU     {caps.cpu_count} cores\n")
+    print(verdict["summary"] + "\n")
+
+    cfg = config.load_config()
+    if not caps.has_gpu or caps.vram_mb < probe.MIN_VRAM_MB:
+        # 4B embeddings are impractically slow without a GPU.
+        cfg.embed_model = "Qwen/Qwen3-Embedding-0.6B"
+    else:
+        cfg.embed_model = "Qwen/Qwen3-Embedding-4B"
+    config.save_config(cfg)
+
+    print("Folders to index:")
+    for folder in cfg.folders:
+        print(f"  {folder}")
+    install.install_user_units()
+    install.install_launcher()
+    install.install_nautilus_script()
+    bound = install.bind_shortcut()
+    print("\nInstalled: background indexing timer, app launcher, Nautilus script")
+    print("Shortcut:  " + ("Super+F" if bound else "not set (GNOME not detected)"))
+    print("\nNothing else is required. Indexing starts automatically.")
+    return 0
+
+
+def _prune(conn) -> dict:
+    """Reclaim space from real deletions.
+
+    Every delete or rename produces a tombstoned catalog row, and can strand
+    file_embedding/vec_embedding rows with nothing else to clean them up --
+    without this the index grows forever even though live search results
+    stay correct via the deleted_at join filter in the meantime.
+    """
+    conn.execute(
+        "DELETE FROM vec_embedding WHERE rowid IN ("
+        "  SELECT rowid FROM file_embedding WHERE content_hash NOT IN ("
+        "    SELECT content_hash FROM file_catalog "
+        "    WHERE deleted_at IS NULL AND content_hash IS NOT NULL))")
+    orphaned = conn.execute(
+        "DELETE FROM file_embedding WHERE content_hash NOT IN ("
+        "  SELECT content_hash FROM file_catalog "
+        "  WHERE deleted_at IS NULL AND content_hash IS NOT NULL)").rowcount
+    purged = conn.execute(
+        "DELETE FROM file_catalog WHERE deleted_at IS NOT NULL "
+        "AND deleted_at < unixepoch() - ?",
+        (PRUNE_TOMBSTONE_DAYS * 86400,)).rowcount
+    conn.commit()
+    if orphaned or purged:
+        conn.execute("ANALYZE")
+    return {"orphaned_vectors": orphaned, "purged_tombstones": purged}
+
+
+def cmd_index(args) -> int:
+    conn, cfg = _open()
+    stats = catalog.crawl(conn, cfg)
+    print(f"catalog: {stats['seen']:,} seen, {stats['added']:,} added, "
+          f"{stats['tombstoned']:,} removed in {stats['seconds']:.1f}s")
+    if stats["skipped_roots"]:
+        print(f"  skipped {len(stats['skipped_roots'])} unreachable folder(s) "
+              f"this run -- their files were left untouched, not removed")
+    if args.catalog_only:
+        return 0
+
+    if args.scheduled and not probe.on_ac_power():
+        # The cheap catalog pass above always runs; only the expensive
+        # enrichment pass waits for mains power, so a laptop on battery
+        # still gets an up-to-date, searchable-by-name index without
+        # burning battery on GPU/CPU-heavy embedding and captioning.
+        print("on battery; enrichment deferred until next run on mains power")
+        _prune(conn)
+        return 0
+
+    today = spent_today = None
+    if args.scheduled:
+        # Cumulative same-day spend, not per-invocation: the hourly timer
+        # calls this every hour, and each firing budgeting the full daily
+        # allowance independently would let actual spend run up to ~24x the
+        # promised "20 minutes a day."
+        today = date.today().isoformat()
+        spent_today = (float(db.get_meta(conn, "budget_spent_today") or 0)
+                       if db.get_meta(conn, "budget_day") == today else 0)
+        seconds = max(0.0, cfg.daily_budget_seconds - spent_today)
+        if seconds <= 0:
+            print("daily budget already spent today; nothing more until tomorrow")
+            _prune(conn)
+            return 0
+    else:
+        seconds = cfg.first_run_budget_seconds
+
+    result = worker.run(conn, cfg, budget_seconds=seconds, limit=args.limit)
+    print(f"enrichment: {result['processed']:,} files -> {result['counts']}")
+
+    if args.scheduled:
+        db.set_meta(conn, "budget_day", today)
+        db.set_meta(conn, "budget_spent_today", str(spent_today + result["seconds"]))
+        _prune(conn)
+    return 0
+
+
+def cmd_auth(args) -> int:
+    if args.provider != "openrouter":
+        print(f"unknown provider: {args.provider}")
+        return 1
+    print(
+        "Enabling the OpenRouter backend sends full document text, raw "
+        "photo bytes, and raw audio/video bytes to OpenRouter's API for "
+        "every file it enriches -- that content leaves this machine. The "
+        "local backend never does this.\n")
+    try:
+        reply = input("Continue and store an API key? [y/N] ")
+    except EOFError:
+        reply = ""
+    if reply.strip().lower() != "y":
+        print("cancelled; backend left unchanged")
+        return 1
+    key = os.environ.get("HUNCH_OPENROUTER_KEY") or getpass.getpass("OpenRouter API key: ")
+    if not key.strip():
+        print("no key entered; cancelled")
+        return 1
+    from .backends.openrouter import store_api_key
+    store_api_key(key.strip())
+    cfg = config.load_config()
+    cfg.backend = "openrouter"
+    config.save_config(cfg)
+    print("key stored and backend set to openrouter")
+    return 0
+
+
+def cmd_search(args) -> int:
+    conn, cfg = _open()
+    results = search_mod.search(conn, cfg, " ".join(args.query),
+                               mode=args.mode, limit=args.limit)
+    if args.json:
+        print(json.dumps([r.__dict__ for r in results], indent=2))
+        return 0 if results else 1
+    if not results:
+        print("no matches")
+        return 1
+    for i, r in enumerate(results, 1):
+        print(f"{i:2}. [{r.score:.2f}] {r.filename}  ({_human(r.size)})")
+        print(f"    {r.path}")
+        if r.snippet:
+            print(f"    {' '.join(r.snippet.split())[:150]}")
+    return 0
+
+
+def cmd_status(args) -> int:
+    conn, _cfg = _open()
+    rows = dict(conn.execute(
+        "SELECT status, count(*) FROM file_catalog WHERE deleted_at IS NULL "
+        "GROUP BY status"))
+    total = sum(rows.values())
+    print(f"{total:,} files catalogued")
+    for status in ("done", "pending", "failed", "skipped", "unsupported"):
+        print(f"  {status:12} {rows.get(status, 0):,}")
+    phase = budget_mod.next_phase(conn)
+    print("\nCurrent phase: " +
+          (budget_mod.PHASE_LABELS[phase] if phase else "up to date"))
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    caps = probe.probe()
+    verdict = caps.verdict()
+    print("Hardware")
+    print(f"  CPU cores      {caps.cpu_count}")
+    print(f"  Memory         {caps.ram_mb} MB")
+    print(f"  GPU            {caps.vram_mb} MB VRAM" if caps.has_gpu
+          else "  GPU            none detected")
+    print("\nTools")
+    for name, ok in (("pdftotext", caps.has_poppler), ("tesseract", caps.has_tesseract),
+                     ("ffmpeg", caps.has_ffmpeg)):
+        print(f"  {name:14} {'found' if ok else 'MISSING'}")
+    print("\nWhat works")
+    for key in ("documents", "image_text", "photo_descriptions", "transcription"):
+        print(f"  {key:20} {'yes' if verdict[key] else 'no'}")
+    print("\n" + verdict["summary"])
+    return 0
+
+
+def cmd_reindex(args) -> int:
+    conn, cfg = _open()
+    if args.embeddings:
+        # Re-embed stored text directly, rather than clearing vec_embedding
+        # and waiting for the next `hunch index` to rebuild it:
+        # enrich_one's dedup fast path treats "file_embedding already has
+        # this content_hash" as proof the vector exists too, so a
+        # subsequent index run would mark every file "done" again without
+        # ever regenerating a vector -- silently leaving semantic search
+        # permanently empty. Re-embedding here also avoids stamping
+        # embed_model to a value worker.run() can never self-heal from: an
+        # empty string is not the same as "no meta row" to
+        # embedding_model_matches, so the mismatch guard would reject
+        # every future `hunch index` run forever, including a second
+        # `hunch reindex --embeddings` attempt.
+        backend = get_backend(cfg)
+        rows = conn.execute(
+            "SELECT rowid, content_hash, extracted_text FROM file_embedding").fetchall()
+        for rowid, chash, text in rows:
+            vector = backend.embed([text or ""])[0]
+            conn.execute("DELETE FROM vec_embedding WHERE rowid = ?", (rowid,))
+            conn.execute("INSERT INTO vec_embedding(rowid, embedding) VALUES (?, ?)",
+                         (rowid, db.serialize(vector)))
+        conn.commit()
+        db.set_meta(conn, "embed_model", backend.model_id)
+        db.set_meta(conn, "embed_dim", str(backend.dim))
+        print(f"rebuilt {len(rows):,} vectors")
+    return 0
+
+
+def cmd_gui(args) -> int:
+    from .gui.app import run_gui
+    return run_gui(" ".join(args.query) if args.query else "")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="hunch",
+                                     description="Find your files by what they mean.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("setup", help="probe hardware and install background indexing")
+
+    p_index = sub.add_parser("index", help="catalog and enrich")
+    p_index.add_argument("--scheduled", action="store_true",
+                         help="use the daily budget instead of the first-run budget")
+    p_index.add_argument("--catalog-only", action="store_true")
+    p_index.add_argument("--limit", type=int, default=0)
+
+    p_search = sub.add_parser("search", help="search the index")
+    p_search.add_argument("query", nargs="+")
+    p_search.add_argument("-m", "--mode", choices=["literal", "semantic", "hybrid"],
+                          default="hybrid")
+    p_search.add_argument("-n", "--limit", type=int, default=20)
+    p_search.add_argument("--json", action="store_true")
+
+    sub.add_parser("status", help="indexing progress")
+    sub.add_parser("doctor", help="report hardware, tools and what works")
+
+    p_reindex = sub.add_parser("reindex", help="rebuild vectors from stored text")
+    p_reindex.add_argument("--embeddings", action="store_true")
+
+    p_auth = sub.add_parser("auth", help="store credentials for a remote backend")
+    p_auth.add_argument("provider", choices=["openrouter"])
+
+    p_gui = sub.add_parser("gui", help="open the search window")
+    p_gui.add_argument("query", nargs="*")
+
+    args = parser.parse_args(argv)
+    handlers = {"setup": cmd_setup, "index": cmd_index, "search": cmd_search,
+                "status": cmd_status, "doctor": cmd_doctor,
+                "reindex": cmd_reindex, "auth": cmd_auth, "gui": cmd_gui}
+    return handlers[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
