@@ -21,6 +21,17 @@ def test_nearest_place_returns_none_for_invalid_coords():
     assert geocode.nearest_place(999.0, 999.0) is None
 
 
+def test_nearest_place_handles_the_antimeridian():
+    # Two points ~20km apart at this latitude, straddling the 180-degree
+    # meridian, must resolve to the same nearby place -- not two different
+    # countries hundreds of kilometers apart, which is what an unwrapped
+    # longitude difference produces (raw ~360-degree gap instead of ~0.2).
+    east = geocode.nearest_place(-17.7, 179.9)
+    west = geocode.nearest_place(-17.7, -179.9)
+    assert east is not None and west is not None
+    assert east == west
+
+
 def test_describe_includes_folder_path_even_with_no_exif(tmp_path):
     from PIL import Image
     d = tmp_path / "Trips" / "Italy 2019"

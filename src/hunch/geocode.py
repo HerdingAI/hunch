@@ -33,9 +33,17 @@ def nearest_place(lat: float | None, lon: float | None) -> str | None:
     lats, lons, names = data
 
     # Equirectangular approximation: exact enough to pick the nearest city and
-    # far cheaper than haversine across 25k rows.
+    # far cheaper than haversine across the dataset. The raw longitude
+    # difference is wrapped into [-180, 180] before use -- without this, a
+    # point at 179.9 and a city at -179.9 (physically ~20km apart, just on
+    # either side of the antimeridian) compute a ~360-degree difference
+    # instead of the true ~0.2-degree one, mislabeling photos taken near the
+    # dateline (Fiji, Tonga, Kiribati, the Aleutians, far-eastern Russia)
+    # with a city from a different country entirely.
     lat_r = math.radians(lat)
-    dx = (lons - lon) * math.cos(lat_r)
+    dlon = lons - lon
+    dlon = (dlon + 180) % 360 - 180
+    dx = dlon * math.cos(lat_r)
     dy = lats - lat
     idx = int(np.argmin(dx * dx + dy * dy))
     return str(names[idx])
