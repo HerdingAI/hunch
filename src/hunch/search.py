@@ -11,6 +11,17 @@ from .config import Config
 # either alone.
 HYBRID_BOOST = 0.15
 
+# vec0's KNN picks its k nearest neighbors *before* this query's outer
+# WHERE/JOIN filters run, so a tombstoned row within the k-nearest set
+# consumes a slot invisibly and never reaches the deleted_at filter to be
+# replaced. Over-fetch so live results have headroom to survive that
+# filtering; the final result list is still capped at `limit` by search()'s
+# own sort+slice. cli.py's scheduled _prune keeps tombstone volume bounded
+# over time -- this margin only has to absorb churn between prune runs, not
+# unbounded growth.
+_FETCH_MULTIPLIER = 8
+_FETCH_CAP = 400
+
 
 @dataclass
 class Result:
@@ -37,6 +48,7 @@ def _literal(conn, query: str, limit: int) -> list[Result]:
 
 
 def _semantic(conn, vector, limit: int) -> list[Result]:
+    fetch_k = min(limit * _FETCH_MULTIPLIER, _FETCH_CAP)
     rows = conn.execute(
         "SELECT c.path, c.filename, c.size_bytes, v.distance, "
         "       substr(e.extracted_text, 1, 240), e.source_kind "
@@ -44,7 +56,7 @@ def _semantic(conn, vector, limit: int) -> list[Result]:
         "JOIN file_embedding e ON e.rowid = v.rowid "
         "JOIN file_catalog c ON c.content_hash = e.content_hash "
         "WHERE v.embedding MATCH ? AND k = ? AND c.deleted_at IS NULL",
-        (db_mod.serialize(vector), limit)).fetchall()
+        (db_mod.serialize(vector), fetch_k)).fetchall()
     out = []
     for path, filename, size, distance, snippet, kind in rows:
         out.append(Result(path, filename, size or 0,
@@ -55,6 +67,9 @@ def _semantic(conn, vector, limit: int) -> list[Result]:
 
 def search(conn, cfg: Config, query: str, mode: str = "hybrid",
            limit: int = 20, backend=None) -> list[Result]:
+    if mode not in ("literal", "semantic", "hybrid"):
+        raise ValueError(f"unknown search mode: {mode!r}")
+
     query = (query or "").strip()
     if not query:
         return []
@@ -65,7 +80,16 @@ def search(conn, cfg: Config, query: str, mode: str = "hybrid",
 
     if mode in ("semantic", "hybrid"):
         backend = backend or get_backend(cfg)
-        vector = backend.embed([query])[0]
+        try:
+            vector = backend.embed([query])[0]
+        except Exception as exc:                       # noqa: BLE001
+            # A remote backend (openrouter/ollama) can fail at any time --
+            # network errors, auth failures, a down model server. Degrade to
+            # whatever the literal pass already found rather than crash the
+            # caller with a raw traceback, matching enrich_one's established
+            # graceful-degrade pattern for this exact backend.embed() call.
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results[:limit]
         by_path = {r.path: r for r in results}
         for hit in _semantic(conn, vector, limit):
             existing = by_path.get(hit.path)
