@@ -41,10 +41,24 @@ def run_gui(initial_query: str = "") -> int:
             super().__init__(application=app, title="Hunch",
                              default_width=900, default_height=620)
             self._timer = None
+            self._idle_timer = None
             self._seq = 0
             self._cfg = config.load_config()
+            # Main-thread-only: _render (dispatched via GLib.idle_add, so
+            # it always runs on the main loop) is the only place this
+            # connection is touched. _work runs in a spawned thread and
+            # opens its own connection instead -- sqlite3.Connection
+            # objects default to check_same_thread=True, so sharing this
+            # one across threads would raise on every search.
             self._conn = db.connect(config.db_path(), dim=self._cfg.embed_dim)
             self._backend = None
+            self._backend_lock = threading.Lock()
+            # Closing the window (Escape) hides it instead of destroying
+            # it; app.hold() (in App.do_activate) keeps the process alive
+            # regardless, so a later `hunch gui` re-activates this same
+            # process via GApplication's single-instance handling instead
+            # of relaunching Python and reloading the embedding model.
+            self.set_hide_on_close(True)
 
             view = Adw.ToolbarView()
             header = Adw.HeaderBar()
@@ -103,15 +117,48 @@ def run_gui(initial_query: str = "") -> int:
             self._seq += 1
             seq = self._seq
             self.status.set_text("searching…")
+            self._reset_idle_timer()
             threading.Thread(target=self._work, args=(text, seq), daemon=True).start()
+            return False
+
+        def _get_backend(self):
+            # Double-checked locking: the common case (already loaded)
+            # never blocks on the lock, and two searches firing close
+            # together can't both pay for loading the embedding model or
+            # race on which one's backend instance wins.
+            if self._backend is None:
+                with self._backend_lock:
+                    if self._backend is None:
+                        self._backend = get_backend(self._cfg)
+            return self._backend
+
+        def _reset_idle_timer(self):
+            if self._idle_timer:
+                GLib.source_remove(self._idle_timer)
+            self._idle_timer = GLib.timeout_add_seconds(
+                IDLE_RELEASE_SECONDS, self._release_backend)
+
+        def _release_backend(self):
+            self._idle_timer = None
+            with self._backend_lock:
+                if self._backend is not None:
+                    self._backend.release()
+                    self._backend = None
             return False
 
         def _work(self, text: str, seq: int):
             try:
-                if self._backend is None:
-                    self._backend = get_backend(self._cfg)
-                results = search_mod.search(self._conn, self._cfg, text,
-                                            backend=self._backend)
+                backend = self._get_backend()
+                # A fresh connection per search: WAL mode (db.connect's own
+                # setup) makes this cheap (~0.3ms) and safe to do
+                # concurrently with the main thread's connection and with a
+                # separate background indexer process.
+                conn = db.connect(config.db_path(), dim=self._cfg.embed_dim)
+                try:
+                    results = search_mod.search(conn, self._cfg, text,
+                                                backend=backend)
+                finally:
+                    conn.close()
                 err = ""
             except Exception as exc:               # noqa: BLE001
                 results, err = [], str(exc)
@@ -213,12 +260,18 @@ def run_gui(initial_query: str = "") -> int:
             self.win = None
 
         def do_activate(self):
-            provider = Gtk.CssProvider()
-            provider.load_from_data(CSS)
-            Gtk.StyleContext.add_provider_for_display(
-                Gdk.Display.get_default(), provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
             if self.win is None:
+                provider = Gtk.CssProvider()
+                provider.load_from_data(CSS)
+                Gtk.StyleContext.add_provider_for_display(
+                    Gdk.Display.get_default(), provider,
+                    Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                # Keeps the process alive after the window is hidden
+                # (Escape / set_hide_on_close above) -- without this,
+                # GApplication exits once its last window closes, and the
+                # whole point of single-instance activation (skip the
+                # model reload) is lost on every reopen.
+                self.hold()
                 self.win = Window(self, self.query)
             self.win.present()
 
