@@ -109,3 +109,40 @@ def test_phase_stalled_detects_a_backlog_that_never_shrinks(tmp_path):
     conn.execute("UPDATE file_catalog SET status='done' WHERE filename='a.txt'")
     conn.commit()
     assert worker._phase_stalled(conn, "document") is False   # backlog shrank
+
+
+def test_caption_one_demotes_source_kind_when_file_is_missing(tmp_path):
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    conn.execute(
+        "INSERT INTO file_embedding(content_hash, extracted_text, source_kind, model) "
+        "VALUES (?,?,?,?)", ("abc123", "ocr text", "image_meta", "stub"))
+    conn.commit()
+    status = worker.caption_one(conn, StubBackend(), Config(), "abc123",
+                                str(tmp_path / "gone.jpg"))
+    assert status == "failed"
+    source_kind = conn.execute(
+        "SELECT source_kind FROM file_embedding WHERE content_hash=?", ("abc123",)).fetchone()[0]
+    assert source_kind == "image"
+
+
+def test_run_survives_an_unhandled_caption_backend_exception(tmp_path):
+    class CrashingCaptionBackend(StubBackend):
+        def describe_image(self, path):
+            raise RuntimeError("simulated captioning backend crash")
+
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    img = tmp_path / "real.jpg"
+    img.write_bytes(b"fake image bytes")
+    conn.execute(
+        "INSERT INTO file_catalog(path, filename, ext, size_bytes, status, content_hash) "
+        "VALUES (?,?,?,?,?,?)", (str(img), "real.jpg", "jpg", 1000, "done", "def456"))
+    conn.execute(
+        "INSERT INTO file_embedding(content_hash, extracted_text, source_kind, model) "
+        "VALUES (?,?,?,?)", ("def456", "ocr text", "image_meta", "stub"))
+    conn.commit()
+    result = worker.run(conn, Config(), budget_seconds=5.0, backend=CrashingCaptionBackend())
+    assert result["processed"] == 1
+    assert result["counts"] == {"failed": 1}
+    source_kind = conn.execute(
+        "SELECT source_kind FROM file_embedding WHERE content_hash=?", ("def456",)).fetchone()[0]
+    assert source_kind == "image"

@@ -161,11 +161,16 @@ def enrich_one(conn, backend, cfg: Config, row) -> str:
 def caption_one(conn, backend, cfg: Config, chash: str, path: str) -> str:
     """Phase 4: upgrade an existing metadata record with a visual description."""
     if not os.path.exists(path):
-        # No retry bookkeeping here, unlike enrich_one: this phase only ever
-        # touches file_embedding, never file_catalog.status, so there is no
-        # status to protect from a premature deletion judgment. A vanished
-        # file just drops out of the next run's query on its own once
-        # catalog.crawl() tombstones the row for real.
+        # Demoted the same way a genuine captioning failure is, below: this
+        # phase deliberately has no retry bookkeeping (unlike enrich_one),
+        # so without this the row would be re-selected and re-attempted on
+        # every remaining iteration of this same run, potentially burning
+        # the whole budget on one file that's already vanished by the time
+        # this phase runs. catalog.crawl() still tombstones the row for
+        # real on its own schedule; this only stops the loop.
+        conn.execute("UPDATE file_embedding SET source_kind='image' "
+                     "WHERE content_hash=?", (chash,))
+        conn.commit()
         return "failed"
     t0 = time.time()
     caption, err = backend.describe_image(path)
@@ -241,7 +246,19 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
         nonlocal processed
         if phase == "image_caption":
             chash, path = item
-            status = caption_one(conn, backend, cfg, chash, path)
+            try:
+                status = caption_one(conn, backend, cfg, chash, path)
+            except Exception as exc:               # noqa: BLE001
+                # An unforeseen captioning bug (OOM, decode failure, backend
+                # timeout) must cost one file, not the run -- captioning is
+                # the least predictable phase by design. Demote the same way
+                # caption_one's own known-failure path does, so a
+                # permanently-broken image doesn't re-crash every future pass.
+                conn.rollback()
+                conn.execute("UPDATE file_embedding SET source_kind='image' "
+                             "WHERE content_hash=?", (chash,))
+                conn.commit()
+                status = "failed"
         else:
             try:
                 status = enrich_one(conn, backend, cfg, item)
