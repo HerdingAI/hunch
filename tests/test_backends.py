@@ -70,3 +70,34 @@ def test_local_backend_transcribe_times_out_without_hanging_forever(monkeypatch)
     text, err = b.transcribe("irrelevant.wav")
     assert text == ""
     assert "timeout" in err
+
+
+def test_local_backend_transcribe_falls_back_to_cpu_on_cuda_failure(monkeypatch):
+    # ctranslate2 (faster-whisper's backend) links its own CUDA stack
+    # independently of torch's, and defers loading it past model
+    # construction to first inference -- so a CUDA/cuBLAS mismatch (a real,
+    # fairly common misconfiguration) never trips _load_whisper()'s own
+    # try/except. It only surfaces here, on the first real transcribe call.
+    import hunch.backends.local_inprocess as mod
+
+    class StubModel:
+        def __init__(self, device):
+            self.device = device
+
+        def transcribe(self, path, beam_size=1):
+            if self.device == "cuda":
+                raise RuntimeError(
+                    "Library libcublas.so.12 is not found or cannot be loaded")
+            return [type("Seg", (), {"text": "fallback ok"})()], None
+
+    monkeypatch.setattr(
+        "faster_whisper.WhisperModel",
+        lambda model_size, device, compute_type: StubModel(device))
+
+    b = mod.LocalBackend(Config())
+    b.device = "cuda"
+    b._whisper_device = "cuda"
+    text, err = b.transcribe("irrelevant.wav")
+    assert text == "fallback ok"
+    assert err == ""
+    assert b._whisper_device == "cpu"      # stuck on cpu, not retried every call
