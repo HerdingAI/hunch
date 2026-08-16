@@ -237,15 +237,36 @@ def cmd_reindex(args) -> int:
         backend = get_backend(cfg)
         rows = conn.execute(
             "SELECT rowid, content_hash, extracted_text FROM file_embedding").fetchall()
-        for rowid, chash, text in rows:
-            vector = backend.embed([text or ""])[0]
+        rebuilt = failed = 0
+        for rowid, _chash, text in rows:
+            try:
+                vector = backend.embed([text or ""])[0]
+            except Exception as exc:                       # noqa: BLE001
+                # Reindex exists specifically to recover a broken index --
+                # a transient failure on one row (e.g. a network hiccup on
+                # the openrouter backend) must not discard every vector
+                # already rebuilt in this same run.
+                failed += 1
+                continue
             conn.execute("DELETE FROM vec_embedding WHERE rowid = ?", (rowid,))
             conn.execute("INSERT INTO vec_embedding(rowid, embedding) VALUES (?, ?)",
                          (rowid, db.serialize(vector)))
-        conn.commit()
-        db.set_meta(conn, "embed_model", backend.model_id)
-        db.set_meta(conn, "embed_dim", str(backend.dim))
-        print(f"rebuilt {len(rows):,} vectors")
+            conn.commit()
+            rebuilt += 1
+        if failed:
+            # Vectors from different models are not comparable (see
+            # db.embedding_model_matches's own docstring) -- stamping
+            # embed_model here would silently claim every vector is on the
+            # new model when some rows are still on the old one, defeating
+            # the mismatch guard entirely. Leave it unset so a rerun (or
+            # worker.run()'s own guard) surfaces the incomplete migration
+            # instead of hiding it.
+            print(f"rebuilt {rebuilt:,} vectors, {failed:,} failed -- "
+                  f"run `hunch reindex --embeddings` again to retry")
+        else:
+            db.set_meta(conn, "embed_model", backend.model_id)
+            db.set_meta(conn, "embed_dim", str(backend.dim))
+            print(f"rebuilt {rebuilt:,} vectors")
     return 0
 
 

@@ -140,3 +140,48 @@ def test_reindex_embeddings_actually_rebuilds_vectors(tmp_path, monkeypatch):
     # The index must not be left permanently mismatched afterward -- this
     # is what previously locked worker.run() out forever.
     assert db_mod.get_meta(conn, "embed_model") == backend.model_id
+
+
+def test_reindex_embeddings_survives_a_failed_row(tmp_path, monkeypatch):
+    # Regression test for a real bug: reindex --embeddings had no per-row
+    # error handling and a single end-of-loop commit, so one transient
+    # embed() failure (e.g. a network hiccup on a remote backend) would
+    # crash the whole command and discard every vector already rebuilt in
+    # that same run -- the exact command a user reaches for to recover a
+    # broken index must not itself be this fragile.
+    from hunch import config as config_mod, db as db_mod, worker as worker_mod
+    from tests.test_worker import StubBackend
+
+    cfg = config_mod.Config()
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    seed_backend = StubBackend()
+    for name, body in [("good.txt", "a lease agreement"), ("bad.txt", "a recipe")]:
+        f = tmp_path / name
+        f.write_text(body)
+        conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                     "VALUES (?,?,?,?,'pending')", (str(f), name, "txt", f.stat().st_size))
+    conn.commit()
+    for row in conn.execute("SELECT id, path, ext, size_bytes FROM file_catalog").fetchall():
+        worker_mod.enrich_one(conn, seed_backend, cfg, row)
+    db_mod.set_meta(conn, "embed_model", seed_backend.model_id)
+    db_mod.set_meta(conn, "embed_dim", str(seed_backend.dim))
+
+    class FlakyBackend(StubBackend):
+        def embed(self, texts):
+            if any("recipe" in t for t in texts):
+                raise RuntimeError("simulated transient failure")
+            return super().embed(texts)
+
+    flaky = FlakyBackend()
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+    monkeypatch.setattr(cli, "get_backend", lambda cfg: flaky)
+
+    rc = cli.main(["reindex", "--embeddings"])
+    assert rc == 0                                    # no crash
+    # Both rows still have a vector: the good one freshly rebuilt, the bad
+    # one left untouched rather than deleted with nothing to replace it.
+    assert conn.execute("SELECT count(*) FROM vec_embedding").fetchone()[0] == 2
+    # An incomplete migration must not be reported as a completed one --
+    # vectors from different models aren't comparable (embedding_model_matches's
+    # own contract), so stamping embed_model here would silently mix them.
+    assert db_mod.get_meta(conn, "embed_model") == seed_backend.model_id
