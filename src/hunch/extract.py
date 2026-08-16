@@ -95,13 +95,23 @@ def _zip_xml(path: str, ext: str) -> tuple[str, str]:
                 names = [n for n in names if n in wanted]
             for name in names[:400]:
                 try:
-                    info = zf.getinfo(name)
-                    if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                    # Bound bytes actually read, not the member's *declared*
+                    # size: zf.getinfo(name).file_size lives in the local
+                    # file header / central directory as attacker-controlled
+                    # metadata, not a measured quantity. A crafted member can
+                    # declare a tiny size while its real payload decompresses
+                    # to hundreds of MB -- zf.read() doesn't notice the lie
+                    # until *after* fully decompressing (the eventual CRC
+                    # check fails too late to bound memory). Reading through
+                    # the file object with a capped read() closes that gap.
+                    with zf.open(name) as mf:
+                        data = mf.read(MAX_ZIP_MEMBER_BYTES + 1)
+                    if len(data) > MAX_ZIP_MEMBER_BYTES:
                         continue      # one pathological member skips, doc doesn't
-                    total += info.file_size
+                    total += len(data)
                     if total > MAX_ZIP_TOTAL_BYTES:
                         break
-                    chunks.append(zf.read(name).decode("utf-8", "replace"))
+                    chunks.append(data.decode("utf-8", "replace"))
                 except Exception:                  # noqa: BLE001
                     continue
     except (zipfile.BadZipFile, OSError) as exc:

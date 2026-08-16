@@ -1,3 +1,4 @@
+import struct
 import zipfile
 
 import hunch.extract as extract
@@ -40,6 +41,32 @@ def test_docx_container_with_oversized_member_is_capped_not_crashed(tmp_path):
         z.writestr("word/document.xml", "a" * (extract.MAX_ZIP_MEMBER_BYTES + 1))
     text, err = extract.extract_document(str(f), "docx", f.stat().st_size, CFG)
     assert text == ""          # the only member present was skipped, not read
+    assert "no readable parts" in err
+
+
+def test_docx_container_with_spoofed_member_size_does_not_bypass_the_cap(tmp_path):
+    # info.file_size is attacker-controlled metadata in the local file header
+    # / central directory, not a measured quantity. A member can declare a
+    # tiny size while its real payload decompresses to something huge -- the
+    # cap must bound bytes actually read, not the declared size.
+    f = tmp_path / "spoofed.docx"
+    real_size = extract.MAX_ZIP_MEMBER_BYTES + 5_000_000
+    with zipfile.ZipFile(f, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("word/document.xml", "a" * real_size)
+
+    data = bytearray(f.read_bytes())
+    spoofed_size = 1000
+    lfh_off = data.find(b"PK\x03\x04")           # local file header
+    struct.pack_into("<I", data, lfh_off + 22, spoofed_size)
+    cdh_off = data.find(b"PK\x01\x02")           # central directory record
+    struct.pack_into("<I", data, cdh_off + 24, spoofed_size)
+    f.write_bytes(data)
+
+    with zipfile.ZipFile(f) as zf:
+        assert zf.getinfo("word/document.xml").file_size == spoofed_size
+
+    text, err = extract.extract_document(str(f), "docx", f.stat().st_size, CFG)
+    assert text == ""          # must not have decompressed and returned the payload
     assert "no readable parts" in err
 
 
