@@ -77,7 +77,12 @@ def run_gui(initial_query: str = "") -> int:
 
             if query:
                 self.entry.set_text(query)
-            GLib.idle_add(self.entry.grab_focus)
+            # grab_focus() returns whether focus succeeded, not "call me
+            # again" -- GLib idle callbacks repeat while their return value
+            # is truthy, so returning it directly turns this into a busy
+            # loop consuming a full CPU core for as long as the window
+            # stays open (reproduced: ~265k calls/sec on a real display).
+            GLib.idle_add(lambda: self.entry.grab_focus() and False)
 
         # --- searching ---------------------------------------------------
         def _on_changed(self, *_a):
