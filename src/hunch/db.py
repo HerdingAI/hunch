@@ -14,7 +14,21 @@ SCHEMA_VERSION = 1
 
 
 def serialize(vector) -> bytes:
-    """Pack a float sequence into sqlite-vec's expected binary layout."""
+    """Pack a float sequence into sqlite-vec's expected binary layout.
+
+    Also L2-normalizes: vec_embedding's `distance` column is Euclidean (its
+    default; nothing configures cosine), and search.py's score formula
+    converts that to cosine similarity via `1 - distance**2/2`, an identity
+    that only holds for unit vectors. local_inprocess.py already normalizes
+    (SentenceTransformer's normalize_embeddings=True), but openrouter.py and
+    ollama.py return whatever their API gives back with no guarantee -- this
+    is the one place every embedding (stored or query) passes through, so
+    normalizing here makes the identity hold everywhere instead of only for
+    one of three backends.
+    """
+    norm = sum(x * x for x in vector) ** 0.5
+    if norm > 0:
+        vector = [x / norm for x in vector]
     return struct.pack(f"{len(vector)}f", *vector)
 
 

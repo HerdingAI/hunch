@@ -161,3 +161,48 @@ def test_unknown_mode_raises_instead_of_silently_returning_nothing(tmp_path):
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+class SixtyDegreeBackend(StubBackend):
+    """query=[1,0] and doc=[0.5, sqrt(3)/2] are both unit vectors at
+    exactly 60 degrees -- true cosine similarity is exactly 0.5. Found via
+    live end-to-end testing: vec_embedding's `distance` column is
+    Euclidean (vec0's untouched default), not cosine, so for these two
+    unit vectors the Euclidean distance is exactly 1.0
+    (sqrt(2-2*cos(60))). The old formula `max(0.0, 1.0 - distance)`
+    computed max(0.0, 1.0 - 1.0) = 0.0 -- a moderately-similar match
+    reported as a *complete* mismatch. Every real search on a real
+    machine showed this: true matches scored ~0.0-0.07 regardless of how
+    relevant they actually were."""
+    dim = 2
+
+    def embed(self, texts):
+        return [[1.0, 0.0] if t == "query" else [0.5, 3 ** 0.5 / 2] for t in texts]
+
+
+def test_semantic_score_reflects_true_cosine_similarity_not_euclidean_distance(tmp_path):
+    conn = db.connect(tmp_path / "i.db", dim=2)
+    cfg, backend = Config(), SixtyDegreeBackend()
+    f = tmp_path / "doc.txt"
+    f.write_text("a moderately related document")
+    conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                 "VALUES (?,?,?,?,'pending')", (str(f), "doc.txt", "txt", f.stat().st_size))
+    conn.commit()
+    row = conn.execute("SELECT id, path, ext, size_bytes FROM file_catalog").fetchone()
+    worker.enrich_one(conn, backend, cfg, row)
+
+    results = search.search(conn, cfg, "query", mode="semantic", backend=backend)
+    assert len(results) == 1
+    assert abs(results[0].score - 0.5) < 1e-4
+
+
+def test_serialize_normalizes_vectors_from_backends_that_do_not(tmp_path):
+    # openrouter.py and ollama.py return whatever their API gives back with
+    # no normalization guarantee -- unlike local_inprocess.py's
+    # normalize_embeddings=True. serialize() must normalize regardless of
+    # source, since search.py's score formula only holds for unit vectors.
+    raw = db.serialize([3.0, 4.0])           # magnitude 5, not unit
+    import struct
+    unpacked = struct.unpack("2f", raw)
+    norm = sum(x * x for x in unpacked) ** 0.5
+    assert abs(norm - 1.0) < 1e-6

@@ -59,8 +59,15 @@ def _semantic(conn, vector, limit: int) -> list[Result]:
         (db_mod.serialize(vector), fetch_k)).fetchall()
     out = []
     for path, filename, size, distance, snippet, kind in rows:
-        out.append(Result(path, filename, size or 0,
-                          max(0.0, 1.0 - float(distance)),
+        # vec_embedding's distance is Euclidean (vec0's default), not
+        # cosine -- `1 - distance` was silently treating it as cosine
+        # distance, which for unit vectors ranges roughly 0-2, while true
+        # Euclidean distance between unit vectors ranges roughly 0-1.4.
+        # That mismatch clamped nearly every real match to 0.0. For unit
+        # vectors (db.serialize L2-normalizes every embedding), cosine
+        # similarity = 1 - euclidean_distance**2 / 2 exactly.
+        cos_sim = 1.0 - (float(distance) ** 2) / 2.0
+        out.append(Result(path, filename, size or 0, max(0.0, cos_sim),
                           (snippet or "").strip(), kind or ""))
     return out
 
