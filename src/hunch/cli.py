@@ -284,7 +284,7 @@ def cmd_search(args) -> int:
 
 
 def cmd_status(args) -> int:
-    conn, _cfg = _open()
+    conn, cfg = _open()
     rows = dict(conn.execute(
         "SELECT status, count(*) FROM file_catalog WHERE deleted_at IS NULL "
         "GROUP BY status"))
@@ -292,6 +292,30 @@ def cmd_status(args) -> int:
     print(f"{total:,} files catalogued")
     for status in ("done", "pending", "failed", "skipped", "unsupported"):
         print(f"  {status:12} {rows.get(status, 0):,}")
+
+    # Where the index actually came from. On a real machine one folder held
+    # 96% of a 149,058-file index -- a scraped-data tree on the Desktop --
+    # which spent the first-index budget on machine-generated JSON and
+    # buried the user's own documents in every search. Nothing in the tool
+    # said so: the counts above look the same whether an index is mostly
+    # your documents or mostly one directory you forgot was there.
+    if total:
+        print("\nWhere they came from")
+        for folder in cfg.folders:
+            n = conn.execute(
+                "SELECT count(*) FROM file_catalog "
+                "WHERE deleted_at IS NULL AND path LIKE ?",
+                (str(folder).rstrip("/") + "/%",)).fetchone()[0]
+            if not n:
+                continue
+            share = 100 * n / total
+            print(f"  {n:>9,}  {share:5.1f}%  {folder}")
+            if share >= 50:
+                print(f"             ^ most of your index. If that is not "
+                      f"what you want searched,\n"
+                      f"               remove it from `folders` in "
+                      f"{config.config_path()}")
+
     phase = budget_mod.next_phase(conn)
     print("\nCurrent phase: " +
           (budget_mod.PHASE_LABELS[phase] if phase else "up to date"))

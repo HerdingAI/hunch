@@ -595,3 +595,34 @@ def test_setup_says_which_configured_folders_do_not_exist(
     assert "not found -- skipped" in out
     assert "does not exist" in out          # and names the count
     assert str(cli.config.config_path()) in out    # and where to fix it
+
+
+def test_status_shows_which_folder_dominates_the_index(tmp_path, monkeypatch, capsys):
+    # From a real machine: one scraped-data tree on the Desktop was 96% of a
+    # 149,058-file index. It consumed the first-index budget and buried the
+    # user's own documents in every search, and nothing in the tool said so
+    # -- the status counts look identical whether an index is mostly your
+    # documents or mostly a directory you forgot was there.
+    from hunch import config as config_mod, db as db_mod
+
+    big, small = tmp_path / "Desktop", tmp_path / "Pictures"
+    cfg = config_mod.Config()
+    cfg.folders = [big, small]
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    for i in range(90):
+        conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                     "VALUES (?,?,?,?,'done')",
+                     (f"{big}/data/f{i}.json", f"f{i}.json", "json", 100))
+    for i in range(10):
+        conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                     "VALUES (?,?,?,?,'done')",
+                     (f"{small}/p{i}.jpg", f"p{i}.jpg", "jpg", 100))
+    conn.commit()
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+
+    assert cli.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "Where they came from" in out
+    assert "90.0%" in out
+    assert "most of your index" in out            # and says what to do
+    assert str(cli.config.config_path()) in out
