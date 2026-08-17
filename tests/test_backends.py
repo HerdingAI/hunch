@@ -61,7 +61,7 @@ def test_local_backend_transcribe_times_out_without_hanging_forever(monkeypatch)
     import hunch.backends.local_inprocess as mod
 
     class HangingModel:
-        def transcribe(self, path, beam_size=1):
+        def transcribe(self, path, beam_size=1, **kw):
             _time.sleep(5)
             return [], None
 
@@ -85,7 +85,7 @@ def test_local_backend_transcribe_falls_back_to_cpu_on_cuda_failure(monkeypatch)
         def __init__(self, device):
             self.device = device
 
-        def transcribe(self, path, beam_size=1):
+        def transcribe(self, path, beam_size=1, **kw):
             if self.device == "cuda":
                 raise RuntimeError(
                     "Library libcublas.so.12 is not found or cannot be loaded")
@@ -200,3 +200,47 @@ def test_release_collects_cycles_so_the_memory_is_actually_freed(monkeypatch):
     # Order matters: collecting after empty_cache() would free the cycles
     # too late for that call to reclaim anything.
     assert order == ["gc", "empty_cache"]
+
+
+def test_transcription_is_capped_to_what_can_reach_a_vector():
+    # Measured on a real library: 2,301 audio files averaging 32 minutes.
+    # The embedder reads the first 8,000 characters and speech runs about
+    # 1,000 chars/minute, so roughly three quarters of every transcription
+    # was decoded at full cost and then truncated away -- the same shape as
+    # reading 200 MB of a file to embed 8 KB, except transcription costs
+    # orders of magnitude more per byte.
+    import hunch.backends.local_inprocess as mod
+
+    seen = {}
+
+    class RecordingModel:
+        def transcribe(self, path, beam_size=1, **kw):
+            seen.update(kw)
+            return [], None
+
+    cfg = Config()
+    cfg.transcribe_max_seconds = 300
+    b = mod.LocalBackend(cfg)
+    b._whisper = RecordingModel()
+    b.transcribe("/tmp/whatever.mp3")
+    assert seen["clip_timestamps"] == [0.0, 300.0]
+
+
+def test_transcription_cap_of_zero_means_the_whole_recording():
+    # The tradeoff is real -- a topic first raised late in a long recording
+    # stops being findable by it -- so opting out has to work.
+    import hunch.backends.local_inprocess as mod
+
+    seen = {}
+
+    class RecordingModel:
+        def transcribe(self, path, beam_size=1, **kw):
+            seen.update(kw)
+            return [], None
+
+    cfg = Config()
+    cfg.transcribe_max_seconds = 0
+    b = mod.LocalBackend(cfg)
+    b._whisper = RecordingModel()
+    b.transcribe("/tmp/whatever.mp3")
+    assert "clip_timestamps" not in seen

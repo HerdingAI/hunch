@@ -57,6 +57,13 @@ hunch doctor
 | Images | text in the image, capture date, place, camera, folder — plus an AI description of the contents |
 | Audio & video | spoken words, transcribed |
 
+By default only the first ten minutes of a recording is transcribed. Search
+embeds roughly the first eight minutes' worth of words, so past that the audio
+would be decoded at full cost and then discarded — on a 1,200-hour library that
+is the difference between hours and days. A topic first raised late in a long
+recording won't be findable by it; set `transcribe_max_seconds = 0` in the
+config to transcribe recordings in full.
+
 ## Hardware
 
 Document search runs on any CPU. Describing photos and transcribing audio are

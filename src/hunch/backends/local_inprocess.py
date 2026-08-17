@@ -150,7 +150,23 @@ class LocalBackend(Backend):
 
     def _transcribe_once(self, model, path: str) -> tuple[str, str]:
         def _run():
-            segments, _info = model.transcribe(path, beam_size=1)
+            # Transcribe an opening slice rather than the whole recording.
+            # The embedder reads the first EMBED_CHARS characters and speech
+            # runs about 1,000 characters per minute, so roughly the first
+            # eight minutes is all that can reach a vector -- past that the
+            # audio is decoded at full cost and then truncated away. Measured
+            # on a real library: 2,301 files averaging 32 minutes, so about
+            # three quarters of every transcription was doing nothing.
+            #
+            # The tradeoff is real and deliberate: a topic first raised late
+            # in a long recording is no longer findable by that topic, only
+            # by its opening. Set transcribe_max_seconds to 0 for the whole
+            # file if that matters more than the time.
+            cap = getattr(self.cfg, "transcribe_max_seconds", 0) or 0
+            kwargs = {"beam_size": 1}
+            if cap > 0:
+                kwargs["clip_timestamps"] = [0.0, float(cap)]
+            segments, _info = model.transcribe(path, **kwargs)
             return " ".join(s.text for s in segments).strip()
 
         # A thread with a deadline can't kill a stuck native call outright,

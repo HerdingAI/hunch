@@ -122,6 +122,12 @@ class Config:
     embed_dim: int = 1024
     vision_model: str = "microsoft/Florence-2-large"
     whisper_model: str = "base"
+    # Seconds of each recording to transcribe; 0 means the whole file.
+    # Aligned to what can actually reach a vector: the embedder reads the
+    # first 8,000 characters and speech runs ~1,000 chars/minute, so beyond
+    # roughly eight minutes the audio is decoded at full cost and then
+    # truncated away. See local_inprocess._transcribe_once.
+    transcribe_max_seconds: int = 600
     openrouter_embed_model: str = "qwen/qwen3-embedding-4b"
     openrouter_vision_model: str = "google/gemma-3-4b-it"
     openrouter_transcribe_model: str = "openai/whisper-large-v3"
