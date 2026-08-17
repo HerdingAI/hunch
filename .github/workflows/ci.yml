@@ -12,7 +12,15 @@ jobs:
       - name: Install system tools
         run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr
       - name: Install package
-        run: pip install -e ".[dev]"
+        # media (faster-whisper) is needed even in a CPU-only CI run --
+        # test_backends.py's whisper CPU-fallback test monkeypatches
+        # faster_whisper.WhisperModel, which requires the module to be
+        # importable. That test verifies CPU-only correctness (no GPU
+        # involved), unlike test_imagemeta.py's GPU-heavy vision paths
+        # below, so it belongs in CI rather than being excluded alongside
+        # them. local (torch/transformers/sentence-transformers) stays
+        # out: nothing else in the suite needs it, and it's multiple GB.
+        run: pip install -e ".[dev,media]"
       # CPU-only: the GPU paths are exercised manually on the reference machine.
       - name: Run tests
         run: python -m pytest tests -v --ignore=tests/test_imagemeta.py
