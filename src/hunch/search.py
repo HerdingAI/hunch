@@ -85,9 +85,18 @@ def _semantic(conn, vector, limit: int) -> list[Result]:
 
 
 def search(conn, cfg: Config, query: str, mode: str = "hybrid",
-           limit: int = 20, backend=None) -> list[Result]:
+           limit: int = 20, backend=None, degraded: list[str] | None = None
+           ) -> list[Result]:
+    """Search the index.
+
+    `degraded` is an optional out-parameter: if the semantic half could not
+    run, the reason is appended to it, so the caller can say so rather than
+    present literal-only results as if they were the whole answer.
+    """
     if mode not in ("literal", "semantic", "hybrid"):
         raise ValueError(f"unknown search mode: {mode!r}")
+    if degraded is None:
+        degraded = []
 
     query = (query or "").strip()
     if not query:
@@ -107,6 +116,13 @@ def search(conn, cfg: Config, query: str, mode: str = "hybrid",
             # whatever the literal pass already found rather than crash the
             # caller with a raw traceback, matching enrich_one's established
             # graceful-degrade pattern for this exact backend.embed() call.
+            #
+            # Record why, though. Degrading silently means the user is told
+            # "no matches" for files that are indexed and would have
+            # matched -- indistinguishable from the files genuinely not
+            # being there, which is the one thing a search tool must never
+            # get wrong. Callers surface this; see cli.cmd_search.
+            degraded.append(str(exc))
             results.sort(key=lambda r: r.score, reverse=True)
             return results[:limit]
         by_path = {r.path: r for r in results}

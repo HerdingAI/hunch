@@ -290,11 +290,20 @@ def cmd_auth(args) -> int:
 
 def cmd_search(args) -> int:
     conn, cfg = _open()
+    degraded: list[str] = []
     results = search_mod.search(conn, cfg, " ".join(args.query),
-                               mode=args.mode, limit=args.limit)
+                               mode=args.mode, limit=args.limit,
+                               degraded=degraded)
     if args.json:
         print(json.dumps([r.__dict__ for r in results], indent=2))
         return 0 if results else 1
+    # Say when only half the search ran. "no matches" from a degraded search
+    # is indistinguishable from "your files aren't indexed", and sends the
+    # user looking for a problem that isn't there.
+    if degraded:
+        print(f"note: only filename matching ran -- the meaning-based half "
+              f"was unavailable ({degraded[0].splitlines()[0][:120]})",
+              file=sys.stderr)
     if not results:
         print("no matches")
         return 1

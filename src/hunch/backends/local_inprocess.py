@@ -40,6 +40,11 @@ class LocalBackend(Backend):
         # embedder/vision model -- which use torch's CUDA and are unaffected
         # -- onto CPU too.
         self._whisper_device = self.device
+        # Tracked separately for the same reason, but a different cause: the
+        # background indexer and an interactive search are two processes
+        # sharing one card. The indexer legitimately holds most of it, so a
+        # search launched mid-index can find no room -- see embed().
+        self._embed_device = self.device
         self._embedder = None
         self._vision = None
         self._vision_proc = None
@@ -50,16 +55,48 @@ class LocalBackend(Backend):
         if self._embedder is None:
             from sentence_transformers import SentenceTransformer
             self._embedder = SentenceTransformer(
-                self.cfg.embed_model, device=self.device,
+                self.cfg.embed_model, device=self._embed_device,
                 truncate_dim=self.cfg.embed_dim)
         return self._embedder
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        model = self._load_embedder()
-        clipped = [(t or "")[:EMBED_CHARS] for t in texts]
+    def _encode(self, model, clipped):
         vecs = model.encode(clipped, batch_size=16, normalize_embeddings=True,
                             show_progress_bar=False)
         return [list(map(float, v)) for v in vecs]
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Embed a batch, falling back to CPU if the GPU has no room.
+
+        Two processes share one card by design: the background indexer runs
+        for hours while the user searches, which the README promises works.
+        On a real 8 GB card the indexer settled at 5.7 GB, leaving 21 MB --
+        so a search launched mid-index could not load the model at all. It
+        did not crash: search.py catches embed() failures and degrades to
+        literal matching, so the user simply got "no matches" for files that
+        were sitting right there, with nothing to suggest the semantic half
+        had never run.
+
+        Falling back is cheap where it matters. Embedding one query on CPU
+        measured 0.07 s (against a 4.9 s one-time model load) -- fine for a
+        search, and the indexer's throughput is unaffected because it is the
+        process that still holds the GPU. Mirrors transcribe()'s existing
+        CPU-retry, including staying on CPU afterward rather than re-paying
+        a load we now know fails.
+        """
+        clipped = [(t or "")[:EMBED_CHARS] for t in texts]
+        try:
+            return self._encode(self._load_embedder(), clipped)
+        except Exception:                          # noqa: BLE001
+            if self._embed_device == "cpu":
+                raise
+            self._embed_device = "cpu"
+            self._embedder = None
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:                      # noqa: BLE001
+                pass
+            return self._encode(self._load_embedder(), clipped)
 
     # --- vision -----------------------------------------------------------
     def _load_vision(self):

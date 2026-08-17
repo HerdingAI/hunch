@@ -242,3 +242,30 @@ def test_duplicate_files_do_not_fill_the_results_with_one_content(tmp_path):
     assert len(results) == 2                      # one per distinct content
     # The outlier is still reachable rather than crowded out.
     assert any(r.filename == "recipe.txt" for r in results)
+
+
+def test_a_degraded_search_reports_why_instead_of_saying_no_matches(tmp_path):
+    # "no matches" from a half-run search is indistinguishable from "your
+    # files are not indexed" -- the one answer a search tool must never give
+    # wrongly. Seen live: the GPU was full, the semantic half never ran, and
+    # the CLI printed "no matches" for indexed files that would have matched.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    cfg = Config()
+    f = tmp_path / "doc.txt"
+    f.write_text("a lease document")
+    conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                 "VALUES (?,?,?,?,'pending')", (str(f), "doc.txt", "txt", f.stat().st_size))
+    conn.commit()
+
+    degraded = []
+    search.search(conn, cfg, "nothing that matches a filename", mode="hybrid",
+                  backend=CrashingBackend(), degraded=degraded)
+    assert degraded and "simulated network failure" in degraded[0]
+
+
+def test_a_healthy_search_reports_no_degradation(tmp_path):
+    conn, cfg, backend = _seed(tmp_path)
+    degraded = []
+    results = search.search(conn, cfg, "lease", mode="hybrid",
+                           backend=backend, degraded=degraded)
+    assert results and degraded == []

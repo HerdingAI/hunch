@@ -101,3 +101,62 @@ def test_local_backend_transcribe_falls_back_to_cpu_on_cuda_failure(monkeypatch)
     assert text == "fallback ok"
     assert err == ""
     assert b._whisper_device == "cpu"      # stuck on cpu, not retried every call
+
+
+def test_embed_falls_back_to_cpu_when_the_gpu_is_full(monkeypatch):
+    # Regression test from the live system: the background indexer settled
+    # at 5.7 GB of an 8 GB card, leaving 21 MB, so a search launched during
+    # indexing could not load the embedder at all. It did not crash --
+    # search.py degrades to literal matching -- so the user was told "no
+    # matches" for files that were indexed and would have matched. The
+    # README promises searching works while indexing runs, and two
+    # processes sharing one card is the normal case, not an edge case.
+    from hunch.backends.local_inprocess import LocalBackend
+    from hunch.config import Config
+
+    b = LocalBackend.__new__(LocalBackend)        # skip __init__'s probing
+    b.cfg = Config()
+    b.device = b._embed_device = "cuda"
+    b._embedder = None
+    loaded = []
+
+    class FakeModel:
+        def __init__(self, device):
+            self.device = device
+
+        def encode(self, texts, **kw):
+            if self.device == "cuda":
+                raise RuntimeError("CUDA out of memory. Tried to allocate 20.00 MiB")
+            return [[0.5, 0.5] for _ in texts]
+
+    def fake_load():
+        loaded.append(b._embed_device)
+        return FakeModel(b._embed_device)
+
+    monkeypatch.setattr(b, "_load_embedder", fake_load)
+    out = b.embed(["a query"])
+
+    assert out == [[0.5, 0.5]]                    # the search still works
+    assert loaded == ["cuda", "cpu"]              # tried the GPU, then fell back
+    assert b._embed_device == "cpu"               # and stays there this session
+
+
+def test_embed_does_not_loop_when_cpu_also_fails(monkeypatch):
+    from hunch.backends.local_inprocess import LocalBackend
+    from hunch.config import Config
+
+    b = LocalBackend.__new__(LocalBackend)
+    b.cfg = Config()
+    b.device = b._embed_device = "cuda"
+    b._embedder = None
+
+    class Broken:
+        def encode(self, texts, **kw):
+            raise RuntimeError("still broken")
+
+    monkeypatch.setattr(b, "_load_embedder", lambda: Broken())
+    try:
+        b.embed(["q"])
+        assert False, "expected the error to surface"
+    except RuntimeError as exc:
+        assert "still broken" in str(exc)
