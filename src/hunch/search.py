@@ -49,13 +49,25 @@ def _literal(conn, query: str, limit: int) -> list[Result]:
 
 def _semantic(conn, vector, limit: int) -> list[Result]:
     fetch_k = min(limit * _FETCH_MULTIPLIER, _FETCH_CAP)
+    # One row per *content*, not per file. Enrichment dedups by content_hash
+    # -- identical files share a single embedding -- but joining catalog rows
+    # back onto it re-expands them: on a real index one embedding was shared
+    # by 11,283 files, so a single vector entering the top-k emitted 11,283
+    # rows at an identical score and buried every other match. Picking the
+    # shortest path per hash keeps a stable, canonical-looking
+    # representative, and it makes the over-fetch above mean what it says:
+    # k vectors now yield up to k distinct results rather than k copies of
+    # one file.
     rows = conn.execute(
         "SELECT c.path, c.filename, c.size_bytes, v.distance, "
         "       substr(e.extracted_text, 1, 240), e.source_kind "
         "FROM vec_embedding v "
         "JOIN file_embedding e ON e.rowid = v.rowid "
-        "JOIN file_catalog c ON c.content_hash = e.content_hash "
-        "WHERE v.embedding MATCH ? AND k = ? AND c.deleted_at IS NULL",
+        "JOIN file_catalog c ON c.id = ("
+        "    SELECT c2.id FROM file_catalog c2 "
+        "    WHERE c2.content_hash = e.content_hash AND c2.deleted_at IS NULL "
+        "    ORDER BY length(c2.path), c2.path LIMIT 1) "
+        "WHERE v.embedding MATCH ? AND k = ?",
         (db_mod.serialize(vector), fetch_k)).fetchall()
     out = []
     for path, filename, size, distance, snippet, kind in rows:

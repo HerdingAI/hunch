@@ -206,3 +206,39 @@ def test_serialize_normalizes_vectors_from_backends_that_do_not(tmp_path):
     unpacked = struct.unpack("2f", raw)
     norm = sum(x * x for x in unpacked) ** 0.5
     assert abs(norm - 1.0) < 1e-6
+
+
+def test_duplicate_files_do_not_fill_the_results_with_one_content(tmp_path):
+    # Regression test from a real 149k-file index: enrichment dedups by
+    # content_hash, so identical files share one embedding -- but joining
+    # catalog rows back onto that embedding re-expanded them. One embedding
+    # there was shared by 11,283 files, so a single vector entering the
+    # top-k emitted 11,283 rows at an identical score and buried every
+    # other match. Searching returned the same content over and over.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    cfg, backend = Config(), VariedBackend()
+    body = "a lease agreement for the flat"
+    for i in range(12):                      # same bytes, twelve paths
+        f = tmp_path / f"copy{i}.txt"
+        f.write_text(body)
+        conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                     "VALUES (?,?,?,?,'pending')",
+                     (str(f), f.name, "txt", f.stat().st_size))
+    other = tmp_path / "recipe.txt"
+    other.write_text("how to bake sourdough bread")
+    conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                 "VALUES (?,?,?,?,'pending')",
+                 (str(other), other.name, "txt", other.stat().st_size))
+    conn.commit()
+    for row in conn.execute("SELECT id, path, ext, size_bytes FROM file_catalog").fetchall():
+        worker.enrich_one(conn, backend, cfg, row)
+
+    # One embedding for the twelve copies, one for the outlier.
+    assert conn.execute("SELECT count(*) FROM file_embedding").fetchone()[0] == 2
+
+    results = search.search(conn, cfg, "lease", mode="semantic", backend=backend)
+    paths = [r.path for r in results]
+    assert len(paths) == len(set(paths))          # no path repeated
+    assert len(results) == 2                      # one per distinct content
+    # The outlier is still reachable rather than crowded out.
+    assert any(r.filename == "recipe.txt" for r in results)
