@@ -11,10 +11,25 @@ Everything runs on your machine by default. Nothing is uploaded.
 ## Install
 
 ```bash
-sudo apt install pipx poppler-utils tesseract-ocr ffmpeg
-pipx install "hunch-search[local,gui,media]"
+sudo apt install pipx poppler-utils tesseract-ocr ffmpeg \
+    python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+
+pipx install --system-site-packages \
+    "hunch-search[local,media] @ git+https://github.com/HerdingAI/hunch@main"
+
 hunch setup
 ```
+
+The first line installs what Hunch shells out to: `pdftotext` for PDFs,
+`tesseract` for text inside images, `ffmpeg` for audio and video, and the
+system GTK bindings the search window uses. `--system-site-packages` is what
+lets the window find those bindings — without it the window won't open,
+though everything else still works from the terminal.
+
+The `local` extra brings the embedding and vision models (PyTorch, several
+GB); `media` brings speech-to-text. Drop either if you don't want it — or
+drop both and run `hunch auth openrouter` to do the heavy lifting in the
+cloud instead.
 
 `hunch setup` checks your hardware, tells you plainly what will work, indexes
 your Documents, Downloads, Desktop and Pictures, and installs a background

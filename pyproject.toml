@@ -47,7 +47,14 @@ local = [
   "timm>=1.0",
 ]
 media = ["faster-whisper>=1.2"]
-gui = ["PyGObject>=3.46"]
+# No `gui` extra on purpose. PyGObject from PyPI builds pycairo and
+# girepository from source, needing a C toolchain plus libcairo2-dev and
+# libgirepository-2.0-dev, and the result must still match the system's
+# GTK/GIR libraries at runtime. Every Linux desktop already ships working
+# bindings as distro packages (python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1),
+# which is exactly what gui/app.py's ImportError message tells the user to
+# install. Install hunch with `pipx install --system-site-packages` so the
+# window can see them.
 dev = ["pytest>=8.0", "pytest-cov>=5.0"]
 
 [project.scripts]

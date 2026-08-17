@@ -31,10 +31,34 @@ def test_doctor_reports_capabilities(capsys, monkeypatch):
     monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
     monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: True)
     monkeypatch.setattr(cli.probe, "media_importable", lambda: True)
+    monkeypatch.setattr(cli.probe, "gui_importable", lambda: True)
     rc = cli.main(["doctor"])
     out = capsys.readouterr().out.lower()
     assert rc == 0
     assert "cpu" in out and ("gpu" in out or "documents" in out)
+
+
+def test_doctor_flags_gtk_bindings_the_window_cannot_reach(monkeypatch, capsys):
+    # PyGObject is a distro package, not a pip extra, so the usual failure
+    # is "installed system-wide but invisible to this venv" (a pipx install
+    # without --system-site-packages). Terminal search keeps working, so
+    # nothing crashes -- doctor is the only place that names it.
+    from hunch.setup.probe import Capabilities
+
+    fake_caps = Capabilities(has_gpu=False, vram_mb=0, ram_mb=8000,
+                             free_disk_mb=50000, cpu_count=4,
+                             has_tesseract=True, has_poppler=True, has_ffmpeg=True)
+    monkeypatch.setattr(cli, "_open", lambda: (object(), object()))
+    monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
+    monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: True)
+    monkeypatch.setattr(cli.probe, "media_importable", lambda: True)
+    monkeypatch.setattr(cli.probe, "gui_importable", lambda: False)
+    monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "MISSING -- sudo apt install python3-gi" in out
 
 
 def test_unknown_command_exits_nonzero():

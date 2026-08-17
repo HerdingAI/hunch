@@ -157,6 +157,19 @@ def local_backend_importable() -> bool:
     return importlib.util.find_spec("sentence_transformers") is not None
 
 
+def gui_importable() -> bool:
+    """Whether the GTK bindings the search window needs are reachable.
+
+    Deliberately not a pip extra (see pyproject.toml): PyGObject comes from
+    the distro, so the usual failure isn't "not installed" but "installed
+    system-wide and invisible to this venv" -- a pipx install without
+    --system-site-packages. Either way the window won't open while the CLI
+    keeps working, which is precisely the kind of half-working state
+    `hunch doctor` exists to name.
+    """
+    return importlib.util.find_spec("gi") is not None
+
+
 def media_importable() -> bool:
     """Whether faster-whisper (the `media` extra) is installed. Needed by
     both the local_inprocess and ollama backends (ollama.py: "Ollama does

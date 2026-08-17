@@ -295,6 +295,11 @@ def cmd_doctor(args) -> int:
     if cfg.backend != "openrouter":
         ok = probe.media_importable()
         print(f"  audio/video     {'found' if ok else 'MISSING -- pipx install \"hunch-search[media]\"'}")
+    # Not a pip extra: the bindings come from the distro, so a miss here
+    # usually means an install without --system-site-packages rather than a
+    # missing package. Terminal search still works either way.
+    ok = probe.gui_importable()
+    print(f"  search window   {'found' if ok else 'MISSING -- sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1'}")
 
     print("\nWhat works")
     for key in ("documents", "image_text", "photo_descriptions", "transcription"):
