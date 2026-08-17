@@ -127,3 +127,31 @@ def test_child_timeout_is_reported(tmp_path):
     text, err = extract.run_child(["sleep", "5"], timeout=1)
     assert text == ""
     assert "timeout" in err.lower()
+
+
+def test_a_huge_text_file_is_not_read_whole_to_embed_a_few_thousand_chars(tmp_path):
+    # Measured on a real 4.5 GB CSV found mid-index: extraction took 1.1 s
+    # and 1.8 GB of peak RSS to produce 208 million characters, of which
+    # worker._store keeps 2,000,000 and the embedder uses 8,000. The read
+    # was bounded by MAX_DOC_BYTES (200 MB), a cap meant for what gets
+    # handed to pdftotext, so ~198 MB per file was read, decoded, cleaned
+    # and discarded.
+    from hunch.config import Config
+    from hunch.extract import MAX_PLAIN_TEXT_BYTES, extract_document
+
+    big = tmp_path / "huge.csv"
+    line = ("col_a,col_b,col_c,some reasonably realistic csv payload\n").encode()
+    with big.open("wb") as fh:
+        for _ in range((MAX_PLAIN_TEXT_BYTES * 3) // len(line)):
+            fh.write(line)
+    size = big.stat().st_size
+    assert size > MAX_PLAIN_TEXT_BYTES * 2      # genuinely larger than the cap
+
+    text, err = extract_document(str(big), "csv", size, Config())
+    assert err == ""
+    # Capped well below the file...
+    assert len(text) <= MAX_PLAIN_TEXT_BYTES
+    # ...but never below what is actually kept downstream. UTF-8 is up to
+    # 4 bytes per character, so the byte cap must leave >= 2M chars for any
+    # encoding; this is what makes the smaller read provably lossless.
+    assert len(text) >= 2_000_000

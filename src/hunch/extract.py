@@ -23,6 +23,16 @@ OCR_TIMEOUT = 180
 FFMPEG_TIMEOUT = 900
 
 MAX_DOC_BYTES = 200 * 1024 * 1024
+# Plain text needs far less than MAX_DOC_BYTES, which exists to bound what
+# gets handed to pdftotext. Everything downstream of a text read is already
+# capped: worker._store keeps text[:2_000_000] and the embedder clips to its
+# context window, so bytes past ~2M chars are read, decoded, cleaned and
+# then thrown away. Measured on a real 4.5 GB CSV: 1.1 s and 1.8 GB of peak
+# RSS to extract 208 million characters, of which 8,000 were embedded.
+# 8 MB is deliberately 4x the 2M-char store cap -- UTF-8 runs to 4 bytes per
+# character, so this still guarantees a full 2M chars for any encoding, and
+# the truncation stays exactly where it always was.
+MAX_PLAIN_TEXT_BYTES = 8 * 1024 * 1024
 # Every other risky format here goes through an external binary under a hard
 # timeout so a crash or hang costs one file, not the run. zipfile is pure
 # Python and can't corrupt memory the way poppler/tesseract can, but reading
@@ -71,7 +81,7 @@ def run_child(cmd: list[str], timeout: int) -> tuple[str, str]:
 def _plain_text(path: str, size: int) -> tuple[str, str]:
     try:
         with open(path, "rb") as fh:
-            raw = fh.read(min(size, MAX_DOC_BYTES))
+            raw = fh.read(min(size, MAX_PLAIN_TEXT_BYTES))
         return raw.decode("utf-8", "replace"), ""
     except OSError as exc:
         return "", f"read failed: {exc}"
