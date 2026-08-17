@@ -171,7 +171,7 @@ def test_scheduled_index_spends_first_run_budget_until_backlog_clears(tmp_path, 
     # Backlog still pending for the first two firings, clears on the third.
     phase_calls = []
 
-    def fake_next_phase(conn):
+    def fake_next_phase(conn, cfg=None):
         phase_calls.append(True)
         return None if len(phase_calls) >= 3 else "document"
 
@@ -652,7 +652,7 @@ def test_index_says_so_when_the_first_pass_ends_with_work_left(tmp_path, monkeyp
     monkeypatch.setattr(cli.worker, "run",
                         lambda *a, **k: {"processed": 5, "counts": {"done": 5},
                                          "seconds": 100.0})
-    monkeypatch.setattr(cli.budget_mod, "next_phase", lambda conn: "document")
+    monkeypatch.setattr(cli.budget_mod, "next_phase", lambda conn, cfg=None: "document")
 
     assert cli.main(["index", "--scheduled"]) == 0
     out = capsys.readouterr().out

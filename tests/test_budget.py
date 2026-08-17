@@ -62,3 +62,19 @@ def test_seconds_per_file_is_none_before_anything_has_been_measured(tmp_path):
     conn = db.connect(tmp_path / "i.db", dim=4)
     assert budget.seconds_per_file(conn, "document") is None
     assert budget.seconds_per_file(conn, "nonsense") is None
+
+
+def test_phase_exts_follows_the_same_config_as_classify():
+    # These two must agree. classify() decides what catalog marks pending;
+    # phase_exts decides what the worker selects. If a user adds an
+    # extension back and only classify() knows about it, those files are
+    # catalogued as pending and then never selected -- pending forever.
+    from hunch.config import Config, classify
+
+    cfg = Config()
+    cfg.doc_ext = set(cfg.doc_ext) | {"json"}
+    assert classify("json", cfg) == "document"
+    assert "json" in budget.phase_exts("document", cfg)
+    # And the default still excludes it, on both sides.
+    assert classify("json") == "unsupported"
+    assert "json" not in budget.phase_exts("document")

@@ -121,7 +121,7 @@ def _timing(conn, kind, stage, seconds, nbytes=None):
 def enrich_one(conn, backend, cfg: Config, row) -> str:
     fid, path, ext, size = row
     size = size or 0
-    kind = classify(ext)
+    kind = classify(ext, cfg)
 
     if kind == "unsupported":
         return _finish(conn, fid, "unsupported")
@@ -242,14 +242,14 @@ def caption_one(conn, backend, cfg: Config, chash: str, path: str) -> str:
     return "done"
 
 
-def _phase_pending_rows(conn, phase: str, batch: int):
+def _phase_pending_rows(conn, phase: str, batch: int, cfg=None):
     if phase == "image_caption":
         return conn.execute(
             "SELECT e.content_hash, c.path FROM file_embedding e "
             "JOIN file_catalog c ON c.content_hash = e.content_hash "
             "WHERE e.source_kind = 'image_meta' AND c.deleted_at IS NULL "
             "ORDER BY c.size_bytes DESC LIMIT ?", (batch,)).fetchall()
-    exts = budget_mod.phase_exts(phase)
+    exts = budget_mod.phase_exts(phase, cfg)
     marks = ",".join("?" * len(exts))
     # last_attempt cooldown, gated on retry_count > 0: a persistently-
     # missing file's enrich_one call sets status back to 'pending' (see
@@ -365,7 +365,7 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
         or its queue runs dry. Returns True if `limit` was hit."""
         try:
             while not phase_budget.exhausted() and not overall.exhausted():
-                rows = _phase_pending_rows(conn, phase, BATCH)
+                rows = _phase_pending_rows(conn, phase, BATCH, cfg)
                 if not rows:
                     return False
                 for item in rows:
@@ -388,7 +388,7 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
             if phase in STAGE_MODEL_PHASES:
                 backend.release()
 
-    leading = budget_mod.next_phase(conn)
+    leading = budget_mod.next_phase(conn, cfg)
     if leading is None:
         return stats()
 
@@ -399,7 +399,7 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
     # (backlog shrinking, or this is the first run) this is a no-op and
     # phases are processed strictly in order to completion, as designed.
     later_active = [p for p in budget_mod.PHASES[budget_mod.PHASES.index(leading) + 1:]
-                    if budget_mod.phase_has_pending(conn, p)]
+                    if budget_mod.phase_has_pending(conn, p, cfg)]
     if later_active and _phase_stalled(conn, leading):
         floor = overall.total * 0.25
         if drain(leading, budget_mod.Budget(max(0.0, overall.total - floor))):
@@ -413,7 +413,7 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
         # Falls through to normal ordering for whatever's left, below.
 
     while not overall.exhausted():
-        phase = budget_mod.next_phase(conn)
+        phase = budget_mod.next_phase(conn, cfg)
         if phase is None:
             break
         if drain(phase, overall):

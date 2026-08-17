@@ -238,7 +238,7 @@ def cmd_index(args) -> int:
             spent = (float(db.get_meta(conn, "first_pass_spent_seconds") or 0)
                      + result["seconds"])
             db.set_meta(conn, "first_pass_spent_seconds", str(spent))
-            if budget_mod.next_phase(conn) is None:
+            if budget_mod.next_phase(conn, cfg) is None:
                 db.set_meta(conn, "first_pass_done", "1")
             elif spent >= cfg.first_run_budget_seconds:
                 # The first pass is over and the corpus did not fit in it.
@@ -359,7 +359,7 @@ def cmd_status(args) -> int:
                       f"               remove it from `folders` in "
                       f"{config.config_path()}")
 
-    phase = budget_mod.next_phase(conn)
+    phase = budget_mod.next_phase(conn, cfg)
     print("\nCurrent phase: " +
           (budget_mod.PHASE_LABELS[phase] if phase else "up to date"))
 
@@ -370,7 +370,7 @@ def cmd_status(args) -> int:
     # so the numbers are real rather than a guess from file counts.
     if phase:
         per_file = budget_mod.seconds_per_file(conn, phase)
-        left = budget_mod.pending_count(conn, phase)
+        left = budget_mod.pending_count(conn, phase, cfg)
         if per_file and left:
             work = left * per_file
             print(f"  {left:,} to go, about {_duration(work)} of processing "

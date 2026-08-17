@@ -31,10 +31,18 @@ def db_path() -> Path:
 
 
 # --- file-type routing ----------------------------------------------------
+# Documents a person wrote or reads. Machine formats are deliberately absent:
+# json, xml, yaml/yml and log are, in practice, config and data dumps rather
+# than anything anyone searches for by meaning, and they arrive in numbers no
+# document format does. Measured on one real machine: 150,432 .json against
+# 3,017 .md and 1,668 .txt -- indexing them spent the entire first-run budget
+# embedding scraped API payloads while the user's actual documents waited
+# behind them, and search returned `{"jobs": []}` for every query. Add them
+# back per-machine via `doc_ext` in config.toml if yours are meaningful.
 DOC_EXT = {
     "pdf", "docx", "doc", "odt", "rtf", "txt", "md", "markdown", "epub",
-    "pptx", "ppt", "xlsx", "xls", "csv", "tsv", "html", "htm", "json",
-    "xml", "yaml", "yml", "log", "tex", "org", "eml", "msg", "mbox",
+    "pptx", "ppt", "xlsx", "xls", "csv", "tsv", "html", "htm",
+    "tex", "org", "eml", "msg", "mbox",
 }
 # Enriched first: these carry the content people actually search for.
 RICH_DOC_EXT = {
@@ -46,15 +54,27 @@ AUDIO_EXT = {"mp3", "wav", "flac", "m4a", "aac", "ogg", "opus", "wma"}
 VIDEO_EXT = {"mp4", "mkv", "avi", "mov", "wmv", "webm", "flv", "m4v", "mpg", "mpeg"}
 
 
-def classify(ext: str) -> str:
+def classify(ext: str, cfg: "Config | None" = None) -> str:
+    """Route an extension to a phase, honouring per-machine overrides.
+
+    Which extensions are worth indexing is genuinely machine-specific -- a
+    writer's folder and a developer's differ by orders of magnitude in what
+    they contain -- so the defaults above are a starting point, not a
+    verdict. cfg is optional so existing callers and tests keep working
+    against the defaults.
+    """
     ext = (ext or "").lower().lstrip(".")
-    if ext in DOC_EXT:
+    docs = cfg.doc_ext if cfg else DOC_EXT
+    images = cfg.image_ext if cfg else IMAGE_EXT
+    audio = cfg.audio_ext if cfg else AUDIO_EXT
+    video = cfg.video_ext if cfg else VIDEO_EXT
+    if ext in docs:
         return "document"
-    if ext in IMAGE_EXT:
+    if ext in images:
         return "image"
-    if ext in AUDIO_EXT:
+    if ext in audio:
         return "audio"
-    if ext in VIDEO_EXT:
+    if ext in video:
         return "video"
     return "unsupported"
 
@@ -116,6 +136,12 @@ class Config:
     # stops being retried on every run.
     max_enrich_retries: int = 3
     ocr_languages: str = "eng+spa"
+    # Editable per machine: see classify() and DOC_EXT's note on why the
+    # defaults exclude json/xml/yaml/log.
+    doc_ext: set[str] = field(default_factory=lambda: set(DOC_EXT))
+    image_ext: set[str] = field(default_factory=lambda: set(IMAGE_EXT))
+    audio_ext: set[str] = field(default_factory=lambda: set(AUDIO_EXT))
+    video_ext: set[str] = field(default_factory=lambda: set(VIDEO_EXT))
     min_size_bytes: int = 16
     exclude_dirs: set[str] = field(default_factory=lambda: set(DEFAULT_EXCLUDE_DIRS))
     exclude_dir_suffixes: tuple[str, ...] = DEFAULT_EXCLUDE_DIR_SUFFIXES
@@ -135,7 +161,8 @@ def load_config(path: Path | None = None) -> Config:
             continue           # forward-compatible: ignore unknown keys
         if key == "folders":
             setattr(cfg, key, [Path(p).expanduser() for p in value])
-        elif key in ("exclude_dirs", "exclude_filenames"):
+        elif key in ("exclude_dirs", "exclude_filenames", "doc_ext",
+                     "image_ext", "audio_ext", "video_ext"):
             setattr(cfg, key, set(value))
         elif key in ("exclude_dir_suffixes", "exclude_file_prefixes"):
             setattr(cfg, key, tuple(value))
@@ -151,6 +178,8 @@ def save_config(cfg: Config, path: Path | None = None) -> None:
     raw["folders"] = [str(p) for p in cfg.folders]
     raw["exclude_dirs"] = sorted(cfg.exclude_dirs)
     raw["exclude_filenames"] = sorted(cfg.exclude_filenames)
+    for key in ("doc_ext", "image_ext", "audio_ext", "video_ext"):
+        raw[key] = sorted(getattr(cfg, key))
     raw["exclude_dir_suffixes"] = list(cfg.exclude_dir_suffixes)
     raw["exclude_file_prefixes"] = list(cfg.exclude_file_prefixes)
     with path.open("wb") as fh:

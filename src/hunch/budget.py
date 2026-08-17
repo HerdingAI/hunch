@@ -61,17 +61,21 @@ def _pending_count(conn, exts: set[str]) -> int:
         f"AND deleted_at IS NULL AND ext IN ({marks})", tuple(exts)).fetchone()[0]
 
 
-def phase_exts(phase: str) -> set[str]:
+def phase_exts(phase: str, cfg=None) -> set[str]:
+    """Extensions a phase claims. Must agree with config.classify(), which
+    is now per-machine configurable -- if a user adds an extension back and
+    only classify() knows, catalog marks those files pending and this query
+    never selects them, leaving them pending forever."""
     if phase == "document":
-        return DOC_EXT
+        return cfg.doc_ext if cfg else DOC_EXT
     if phase in ("image_meta", "image_caption"):
-        return IMAGE_EXT
+        return cfg.image_ext if cfg else IMAGE_EXT
     if phase == "audio":
-        return AUDIO_EXT | VIDEO_EXT
+        return (cfg.audio_ext | cfg.video_ext) if cfg else (AUDIO_EXT | VIDEO_EXT)
     return set()
 
 
-def pending_count(conn, phase: str) -> int:
+def pending_count(conn, phase: str, cfg=None) -> int:
     if phase == "image_caption":
         # Captioning upgrades rows that already have a metadata record.
         return conn.execute(
@@ -79,17 +83,17 @@ def pending_count(conn, phase: str) -> int:
             "JOIN file_embedding e ON e.content_hash = c.content_hash "
             "WHERE c.deleted_at IS NULL AND e.source_kind = 'image_meta'"
         ).fetchone()[0]
-    return _pending_count(conn, phase_exts(phase))
+    return _pending_count(conn, phase_exts(phase, cfg))
 
 
-def phase_has_pending(conn, phase: str) -> bool:
-    return pending_count(conn, phase) > 0
+def phase_has_pending(conn, phase: str, cfg=None) -> bool:
+    return pending_count(conn, phase, cfg) > 0
 
 
-def next_phase(conn) -> str | None:
+def next_phase(conn, cfg=None) -> str | None:
     """First phase with work left, in the fixed order above."""
     for phase in PHASES:
-        if phase_has_pending(conn, phase):
+        if phase_has_pending(conn, phase, cfg):
             return phase
     return None
 

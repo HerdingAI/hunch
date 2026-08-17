@@ -171,7 +171,7 @@ def crawl(conn, cfg: Config, folders: list[Path] | None = None) -> dict:
                 # round-trip to the real file, so enrichment could never open
                 # it. Mark it rather than let it look like a real failure.
                 status = "skipped"
-            elif classify(ext) == "unsupported":
+            elif classify(ext, cfg) == "unsupported":
                 status = "unsupported"
             else:
                 status = "pending"

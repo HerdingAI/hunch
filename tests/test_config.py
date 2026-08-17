@@ -58,3 +58,37 @@ def test_exclusions_cover_dependency_and_junk_patterns():
         assert d in cfg.exclude_dirs
     assert cfg.exclude_dir_suffixes == (".dist-info", ".egg-info")
     assert cfg.exclude_file_prefixes == ("._", "~$", ".~lock.")
+
+
+def test_machine_data_formats_are_not_documents_by_default():
+    # Measured on a real machine: 150,432 .json against 3,017 .md and 1,668
+    # .txt. Treating scraped API payloads and config dumps as documents
+    # spent the entire first-run budget embedding them while the user's
+    # actual files waited behind, and every search returned JSON.
+    for ext in ("json", "xml", "yaml", "yml", "log"):
+        assert c.classify(ext) == "unsupported", ext
+    # Things people actually write and read stay documents.
+    for ext in ("pdf", "docx", "txt", "md", "epub", "xlsx", "csv"):
+        assert c.classify(ext) == "document", ext
+
+
+def test_extensions_are_configurable_per_machine():
+    # Which extensions matter is machine-specific, so the defaults are a
+    # starting point rather than a verdict.
+    cfg = c.Config()
+    cfg.doc_ext = set(cfg.doc_ext) | {"json"}
+    assert c.classify("json", cfg) == "document"
+    cfg.doc_ext = {"pdf"}
+    assert c.classify("txt", cfg) == "unsupported"
+    assert c.classify("pdf", cfg) == "document"
+
+
+def test_extension_overrides_survive_a_config_roundtrip(tmp_path):
+    cfg = c.Config()
+    cfg.doc_ext = {"pdf", "json"}
+    cfg.video_ext = {"mp4"}
+    path = tmp_path / "config.toml"
+    c.save_config(cfg, path)
+    back = c.load_config(path)
+    assert back.doc_ext == {"pdf", "json"}
+    assert back.video_ext == {"mp4"}
