@@ -48,3 +48,41 @@ def test_index_file_and_dir_are_owner_only(tmp_path):
     db.connect(db_path)
     assert stat.S_IMODE(db_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(db_path.parent.stat().st_mode) == 0o700
+
+
+def test_a_reader_never_takes_the_write_lock(tmp_path):
+    # Regression test for the worst bug live testing found: db.connect()
+    # ran executescript(), CREATE VIRTUAL TABLE and set_meta() on *every*
+    # open, so `hunch status`, `hunch search` and the GUI each tried to take
+    # the write lock the indexer already held, and died with a raw
+    # sqlite3.OperationalError "database is locked" traceback. Reproduced
+    # against a real 149k-file index mid-run: every search crashed for the
+    # entire multi-hour first pass -- precisely the failure WAL exists to
+    # prevent, defeated by schema setup sitting in the common path.
+    import sqlite3
+
+    path = tmp_path / "i.db"
+    db.connect(path, dim=4)
+
+    # Hold the write lock the way a long enrichment transaction does.
+    writer = sqlite3.connect(path)
+    writer.execute("BEGIN EXCLUSIVE")
+    writer.execute("INSERT INTO meta(key, value) VALUES ('holding', '1')")
+    try:
+        reader = db.connect(path, dim=4)
+        assert reader.execute(
+            "SELECT count(*) FROM file_catalog").fetchone()[0] == 0
+    finally:
+        writer.rollback()
+        writer.close()
+
+
+def test_schema_is_still_created_on_a_fresh_database(tmp_path):
+    # The other half of the fix: skipping the writes must not skip setup on
+    # a database that genuinely has none.
+    conn = db.connect(tmp_path / "fresh.db", dim=4)
+    names = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table','view')")}
+    assert {"file_catalog", "file_embedding", "meta"} <= names
+    assert db.get_meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
+    assert db.vec_dim(conn) == 4

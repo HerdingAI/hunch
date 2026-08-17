@@ -48,27 +48,54 @@ def connect(path: Path | None = None, dim: int | None = None) -> sqlite3.Connect
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
 
-    # WAL lets the GUI read while the worker writes; without it a long
-    # enrichment transaction would block every search.
-    conn.execute("PRAGMA journal_mode = WAL")
+    # Connection-local settings: these configure this handle, they do not
+    # write to the database file, so they are safe on every open.
     conn.execute("PRAGMA synchronous = NORMAL")
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
 
-    schema = (Path(__file__).parent / "schema.sql").read_text()
-    conn.executescript(schema)
+    # Everything below writes. Doing it unconditionally made every reader a
+    # writer: `hunch status`, `hunch search` and the GUI all opened the db,
+    # immediately tried to take the write lock, and lost it to the indexer
+    # -- crashing with a raw "database is locked" traceback for the whole
+    # multi-hour first index. That is the exact failure WAL is meant to
+    # prevent (see the journal_mode line below), defeated by the schema
+    # setup sitting in the common path. An already-initialised database
+    # needs none of it, so readers now take the lock-free WAL read path.
+    if _needs_init(conn):
+        # Persistent in the file itself, so it only has to be set once --
+        # and setting it is a write, which is why it lives in here.
+        conn.execute("PRAGMA journal_mode = WAL")
+        schema = (Path(__file__).parent / "schema.sql").read_text()
+        conn.executescript(schema)
 
-    if dim is None:
-        stored = get_meta(conn, "embed_dim")
-        dim = int(stored) if stored else config.Config().embed_dim
-    # Virtual table dimension is fixed at creation, so it lives outside
-    # schema.sql where the value can be interpolated.
-    conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_embedding "
-        f"USING vec0(embedding float[{dim}])"
-    )
-    set_meta(conn, "schema_version", str(SCHEMA_VERSION))
-    conn.commit()
+        if dim is None:
+            stored = get_meta(conn, "embed_dim")
+            dim = int(stored) if stored else config.Config().embed_dim
+        # Virtual table dimension is fixed at creation, so it lives outside
+        # schema.sql where the value can be interpolated.
+        conn.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_embedding "
+            f"USING vec0(embedding float[{dim}])"
+        )
+        set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+        conn.commit()
     return conn
+
+
+def _needs_init(conn: sqlite3.Connection) -> bool:
+    """True when this database still needs its schema written.
+
+    Read-only by design: it must not be the thing that takes a write lock.
+    A missing `meta` table raises OperationalError, which is simply what a
+    brand-new (or pre-schema) database looks like from here.
+    """
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.OperationalError:
+        return True
+    return row is None or row[0] != str(SCHEMA_VERSION)
 
 
 def get_meta(conn: sqlite3.Connection, key: str) -> str | None:

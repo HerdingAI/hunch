@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from datetime import date
+from pathlib import Path
 
 from . import budget as budget_mod
 from . import catalog, config, db, search as search_mod, worker
@@ -72,9 +73,23 @@ def cmd_setup(args) -> int:
             "files would fail to transcribe until this is fixed.\n"
             '  pipx install --force "hunch-search[media]"')
 
+    # Listing a folder that isn't there reads as "this will be indexed".
+    # On a machine whose Documents and Downloads live on another drive --
+    # a relocated XDG setup, an external disk, a synced folder not yet
+    # mounted -- the default list is partly fiction, and the user is told
+    # "Nothing else is required" while their actual documents are never
+    # touched. Say which ones are real.
+    missing = [f for f in cfg.folders if not Path(f).is_dir()]
     print("Folders to index:")
     for folder in cfg.folders:
-        print(f"  {folder}")
+        print(f"  {folder}" + ("   (not found -- skipped)"
+                               if Path(folder) in map(Path, missing) else ""))
+    if missing:
+        print(f"\n{len(missing)} of these {'folder does' if len(missing) == 1 else 'folders do'} "
+              f"not exist and will be skipped. If your files live elsewhere "
+              f"(another drive, an external disk), edit `folders` in\n"
+              f"  {config.config_path()}\n"
+              f"then run `hunch index`.")
     try:
         install.install_user_units()
         timer_ok = True

@@ -560,3 +560,38 @@ def test_prune_does_not_orphan_a_hash_still_held_by_an_unpurged_tombstone_during
     new_status = conn.execute(
         "SELECT status FROM file_catalog WHERE filename='new.txt'").fetchone()[0]
     assert new_status == "pending"
+
+
+def test_setup_says_which_configured_folders_do_not_exist(
+        tmp_path, monkeypatch, capsys):
+    # Found on a real machine: the default folder list is hardcoded to
+    # ~/Documents, ~/Downloads, ~/Desktop, ~/Pictures, but this machine's
+    # Documents and Downloads live on another drive. setup listed all four
+    # as "Folders to index" and then said "Nothing else is required",
+    # while the user's actual document library was never touched.
+    from hunch.setup.probe import Capabilities
+
+    real = tmp_path / "Pictures"
+    real.mkdir()
+    gone = tmp_path / "Documents"          # deliberately not created
+
+    cfg = cli.config.Config()
+    cfg.folders = [gone, real]
+    fake_caps = Capabilities(has_gpu=False, vram_mb=0, ram_mb=8000,
+                             free_disk_mb=50000, cpu_count=4,
+                             has_tesseract=True, has_poppler=True, has_ffmpeg=True)
+    monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
+    monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: True)
+    monkeypatch.setattr(cli.probe, "media_importable", lambda: True)
+    monkeypatch.setattr(cli.config, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli.config, "save_config", lambda c: None)
+    monkeypatch.setattr(cli.install, "install_user_units", lambda: [])
+    monkeypatch.setattr(cli.install, "install_launcher", lambda: tmp_path / "x.desktop")
+    monkeypatch.setattr(cli.install, "install_nautilus_script", lambda: tmp_path / "s")
+    monkeypatch.setattr(cli.install, "bind_shortcut", lambda: False)
+
+    assert cli.main(["setup"]) == 0
+    out = capsys.readouterr().out
+    assert "not found -- skipped" in out
+    assert "does not exist" in out          # and names the count
+    assert str(cli.config.config_path()) in out    # and where to fix it
