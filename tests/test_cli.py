@@ -177,6 +177,7 @@ def test_setup_reports_a_failed_timer_install_instead_of_claiming_success(
                              has_tesseract=True, has_poppler=True, has_ffmpeg=True)
     monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
     monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: True)
+    monkeypatch.setattr(cli.probe, "media_importable", lambda: True)
     monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
     monkeypatch.setattr(cli.config, "save_config", lambda cfg: None)
     monkeypatch.setattr(
@@ -210,6 +211,7 @@ def test_setup_warns_instead_of_claiming_success_when_embedding_deps_are_missing
                              has_tesseract=True, has_poppler=True, has_ffmpeg=True)
     monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
     monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: False)
+    monkeypatch.setattr(cli.probe, "media_importable", lambda: True)
     monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
     monkeypatch.setattr(cli.config, "save_config", lambda cfg: None)
     monkeypatch.setattr(cli.install, "install_user_units", lambda: [])
@@ -225,6 +227,36 @@ def test_setup_warns_instead_of_claiming_success_when_embedding_deps_are_missing
     # The timer itself installed fine -- only the embedding deps are the
     # problem, so this warning must not be mistaken for the timer one.
     assert "could not install the background indexing timer" not in out
+
+
+def test_setup_warns_when_media_deps_are_missing_even_though_local_is_fine(
+        tmp_path, monkeypatch, capsys):
+    # Regression test for a real gap the re-review caught: cmd_setup only
+    # checked local_backend_importable(), not media_importable() -- a
+    # narrower variant of the same C1 failure mode (audio/video files, not
+    # every file) went unwarned by `hunch setup` even though `hunch doctor`
+    # already covered it.
+    from hunch.setup.probe import Capabilities
+
+    fake_caps = Capabilities(has_gpu=False, vram_mb=0, ram_mb=8000,
+                             free_disk_mb=50000, cpu_count=4,
+                             has_tesseract=True, has_poppler=True, has_ffmpeg=True)
+    monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
+    monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: True)
+    monkeypatch.setattr(cli.probe, "media_importable", lambda: False)
+    monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
+    monkeypatch.setattr(cli.config, "save_config", lambda cfg: None)
+    monkeypatch.setattr(cli.install, "install_user_units", lambda: [])
+    monkeypatch.setattr(cli.install, "install_launcher", lambda: tmp_path / "x.desktop")
+    monkeypatch.setattr(cli.install, "install_nautilus_script", lambda: tmp_path / "script")
+    monkeypatch.setattr(cli.install, "bind_shortcut", lambda: False)
+
+    rc = cli.main(["setup"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert 'pipx install --force "hunch-search[media]"' in out
+    assert "Nothing else is required" not in out
+    assert 'hunch-search[local]' not in out    # local deps were fine
 
 
 def test_doctor_flags_a_missing_local_embedding_dependency(monkeypatch, capsys):

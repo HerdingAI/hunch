@@ -62,6 +62,15 @@ def cmd_setup(args) -> int:
             "installed -- every file would fail to index until this is fixed.\n"
             '  pipx install --force "hunch-search[local]"\n'
             "or run `hunch auth openrouter` to use a cloud backend instead.")
+    # A narrower variant of the same failure mode: only audio/video files
+    # are affected (not every file), but they'd still fail silently and
+    # forever without this, exactly like the check above.
+    media_ok = cfg.backend == "openrouter" or probe.media_importable()
+    if not media_ok:
+        print(
+            "\nWARNING: faster-whisper is not installed -- audio and video "
+            "files would fail to transcribe until this is fixed.\n"
+            '  pipx install --force "hunch-search[media]"')
 
     print("Folders to index:")
     for folder in cfg.folders:
@@ -82,7 +91,7 @@ def cmd_setup(args) -> int:
     print("\nInstalled: " + ("background indexing timer, " if timer_ok else "") +
           "app launcher, Nautilus script")
     print("Shortcut:  " + ("Super+F" if bound else "not set (GNOME not detected)"))
-    if timer_ok and deps_ok:
+    if timer_ok and deps_ok and media_ok:
         print("\nNothing else is required. Indexing starts automatically.")
     return 0
 
