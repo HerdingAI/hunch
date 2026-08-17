@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import getpass
 import json
 import os
@@ -24,6 +25,50 @@ def _open():
     cfg = config.load_config()
     conn = db.connect(config.db_path(), dim=cfg.embed_dim)
     return conn, cfg
+
+
+def _acquire_index_lock(path: Path):
+    """Refuse a second concurrent `hunch index`, rather than let it crash.
+
+    Two enrichment passes writing the same catalog at once is not just a
+    SQLite contention risk -- worker.py opens a write transaction and holds
+    it across the actual transcribe/caption/embed call (see worker.run's
+    module docstring: "each file's embedding write plus status flip happens
+    in one transaction"), which on a real audio file runs several seconds.
+    A second `hunch index` landing mid-transaction hits SQLITE_BUSY_SNAPSHOT,
+    which -- unlike ordinary lock contention -- busy_timeout does not retry:
+    the second connection's read snapshot is already stale by the time it
+    tries to write, so waiting longer cannot help it. Reproduced live: the
+    hourly scheduled timer crashed three runs in a row (every firing while a
+    long manual `hunch index` was active), each failing in well under a
+    second -- exactly what a non-retryable error looks like. A repeatedly
+    failing systemd service can eventually hit its start-limit and stop
+    being retried at all, silently ending scheduled indexing for good.
+    Refusing to start is also strictly cheaper than the alternative of
+    letting both runs proceed: two enrichment passes would double up on the
+    same GPU-bound models for no benefit, since they would both be indexing
+    the same pending rows.
+
+    Locked next to the database this connection actually points at --
+    resolved from the live connection rather than config.data_dir(), so a
+    test (or a second install pointed at its own XDG_DATA_HOME) gets its
+    own lock file instead of contending on this machine's real one.
+
+    Returns the open, locked file handle (release with _release_index_lock)
+    or None if another `hunch index` already holds it.
+    """
+    fh = open(path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def _release_index_lock(fh) -> None:
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
 
 
 def _human(n: int | None) -> str:
@@ -169,6 +214,18 @@ def _prune(conn) -> dict:
 
 def cmd_index(args) -> int:
     conn, cfg = _open()
+    db_file = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    lock = _acquire_index_lock(db_file.with_name(db_file.name + ".lock"))
+    if lock is None:
+        print("another `hunch index` is already running; skipping this run")
+        return 0
+    try:
+        return _cmd_index_locked(args, conn, cfg)
+    finally:
+        _release_index_lock(lock)
+
+
+def _cmd_index_locked(args, conn, cfg) -> int:
     stats = catalog.crawl(conn, cfg)
     print(f"catalog: {stats['seen']:,} seen, {stats['added']:,} added, "
           f"{stats['tombstoned']:,} removed in {stats['seconds']:.1f}s")

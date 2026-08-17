@@ -84,6 +84,66 @@ def test_auth_openrouter_stores_key_and_switches_backend_on_confirmation(monkeyp
     assert saved["cfg"].backend == "openrouter"
 
 
+def test_a_second_concurrent_index_refuses_to_run_instead_of_crashing(
+        tmp_path, monkeypatch, capsys):
+    # Reproduced live: the hourly scheduled timer crashed three runs in a
+    # row with "sqlite3.OperationalError: database is locked" while a long
+    # manual `hunch index` was still active -- each failure in well under a
+    # second, because worker.py holds a write transaction open across the
+    # actual transcribe/caption/embed call, and a second writer's read
+    # snapshot goes stale before it can retry its way in. A repeatedly
+    # failing systemd service can eventually hit its start-limit and stop
+    # being retried at all, silently ending scheduled indexing for good.
+    import fcntl
+    from hunch import config as config_mod, db as db_mod
+
+    cfg = config_mod.Config()
+    cfg.folders = [tmp_path]
+    conn = db_mod.connect(tmp_path / "i.db", dim=cfg.embed_dim)
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+
+    crawled = []
+    monkeypatch.setattr(cli.catalog, "crawl", lambda c, cf: crawled.append(1))
+
+    # Simulate another `hunch index` already holding the lock this run
+    # would need -- exactly what a concurrent scheduled/manual overlap
+    # looks like.
+    lock_path = tmp_path / "i.db.lock"
+    held = open(lock_path, "w")
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        rc = cli.main(["index", "--scheduled"])
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+        held.close()
+
+    assert rc == 0
+    assert "already running" in capsys.readouterr().out
+    assert crawled == []          # refused before touching the catalog at all
+
+
+def test_index_runs_normally_once_the_other_instance_is_done(tmp_path, monkeypatch):
+    from hunch import config as config_mod, db as db_mod
+
+    cfg = config_mod.Config()
+    cfg.folders = [tmp_path]
+    conn = db_mod.connect(tmp_path / "i.db", dim=cfg.embed_dim)
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+
+    crawled = []
+    monkeypatch.setattr(
+        cli.catalog, "crawl",
+        lambda c, cf: crawled.append(1) or {
+            "seen": 0, "added": 0, "updated": 0, "tombstoned": 0,
+            "seconds": 0.0, "skipped_roots": []})
+    monkeypatch.setattr(cli, "_prune", lambda c: None)
+
+    rc = cli.main(["index", "--catalog-only"])
+
+    assert rc == 0
+    assert crawled == [1]         # no lock held elsewhere -- runs for real
+
+
 def test_scheduled_index_tracks_cumulative_daily_spend(tmp_path, monkeypatch):
     from hunch import config as config_mod, db as db_mod
 
