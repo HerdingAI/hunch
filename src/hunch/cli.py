@@ -71,20 +71,33 @@ def _prune(conn) -> dict:
     file_embedding/vec_embedding rows with nothing else to clean them up --
     without this the index grows forever even though live search results
     stay correct via the deleted_at join filter in the meantime.
+
+    Order matters: purge tombstones past their retention window FIRST,
+    then collect embeddings no catalog row references at all (tombstoned
+    or not). A hash still held by a tombstoned-but-not-yet-purged row is
+    NOT orphaned -- collecting it anyway breaks two real cases: deleting a
+    file, having it pruned, then restoring it byte-identical (a Trash
+    restore, a re-added git-tracked file) permanently loses its embedding
+    with no re-enrichment path since the row goes straight back to
+    status='done' unchanged; and a move/rename, where the old path's row
+    is tombstoned in the same crawl that inserts the new path's row --
+    if the worker hasn't reached the new row yet when this runs, its
+    content_hash is still NULL, so the *only* thing keeping the shared
+    embedding alive is the old row's tombstone still referencing it.
     """
-    conn.execute(
-        "DELETE FROM vec_embedding WHERE rowid IN ("
-        "  SELECT rowid FROM file_embedding WHERE content_hash NOT IN ("
-        "    SELECT content_hash FROM file_catalog "
-        "    WHERE deleted_at IS NULL AND content_hash IS NOT NULL))")
-    orphaned = conn.execute(
-        "DELETE FROM file_embedding WHERE content_hash NOT IN ("
-        "  SELECT content_hash FROM file_catalog "
-        "  WHERE deleted_at IS NULL AND content_hash IS NOT NULL)").rowcount
     purged = conn.execute(
         "DELETE FROM file_catalog WHERE deleted_at IS NOT NULL "
         "AND deleted_at < unixepoch() - ?",
         (PRUNE_TOMBSTONE_DAYS * 86400,)).rowcount
+    conn.execute(
+        "DELETE FROM vec_embedding WHERE rowid IN ("
+        "  SELECT rowid FROM file_embedding WHERE content_hash NOT IN ("
+        "    SELECT content_hash FROM file_catalog "
+        "    WHERE content_hash IS NOT NULL))")
+    orphaned = conn.execute(
+        "DELETE FROM file_embedding WHERE content_hash NOT IN ("
+        "  SELECT content_hash FROM file_catalog "
+        "  WHERE content_hash IS NOT NULL)").rowcount
     conn.commit()
     if orphaned or purged:
         conn.execute("ANALYZE")

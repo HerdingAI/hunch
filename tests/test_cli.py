@@ -185,3 +185,150 @@ def test_reindex_embeddings_survives_a_failed_row(tmp_path, monkeypatch):
     # vectors from different models aren't comparable (embedding_model_matches's
     # own contract), so stamping embed_model here would silently mix them.
     assert db_mod.get_meta(conn, "embed_model") == seed_backend.model_id
+
+
+def test_prune_leaves_a_fresh_tombstones_embedding_alone(tmp_path):
+    # Regression test for a real bug: _prune's orphan-detection queries
+    # filtered on deleted_at IS NULL, so a file tombstoned this second (not
+    # yet past PRUNE_TOMBSTONE_DAYS) was treated as if it didn't reference
+    # its content_hash at all -- its embedding was deleted immediately
+    # instead of waiting out the retention window, defeating the point of
+    # having one.
+    from hunch import catalog, config as config_mod, db as db_mod
+    from hunch import worker as worker_mod
+    from tests.test_worker import StubBackend
+
+    root = tmp_path / "root"
+    root.mkdir()
+    cfg = config_mod.Config()
+    cfg.folders = [root]
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    f = root / "a.txt"
+    f.write_text("a lease agreement for the flat")
+    catalog.crawl(conn, cfg)
+    row = conn.execute(
+        "SELECT id, path, ext, size_bytes FROM file_catalog").fetchone()
+    worker_mod.enrich_one(conn, StubBackend(), cfg, row)
+
+    f.unlink()
+    catalog.crawl(conn, cfg)      # tombstones the row
+    cli._prune(conn)
+
+    assert conn.execute("SELECT count(*) FROM file_embedding").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM vec_embedding").fetchone()[0] == 1
+
+
+def test_prune_purges_old_tombstones_and_their_orphaned_embeddings(tmp_path):
+    from hunch import catalog, config as config_mod, db as db_mod
+    from hunch import worker as worker_mod
+    from tests.test_worker import StubBackend
+
+    root = tmp_path / "root"
+    root.mkdir()
+    cfg = config_mod.Config()
+    cfg.folders = [root]
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    f = root / "a.txt"
+    f.write_text("a lease agreement for the flat")
+    catalog.crawl(conn, cfg)
+    row = conn.execute(
+        "SELECT id, path, ext, size_bytes FROM file_catalog").fetchone()
+    worker_mod.enrich_one(conn, StubBackend(), cfg, row)
+
+    f.unlink()
+    catalog.crawl(conn, cfg)
+    conn.execute(
+        "UPDATE file_catalog SET deleted_at = unixepoch() - ?",
+        (cli.PRUNE_TOMBSTONE_DAYS * 86400 + 1,))
+    conn.commit()
+    stats = cli._prune(conn)
+
+    assert stats == {"orphaned_vectors": 1, "purged_tombstones": 1}
+    assert conn.execute("SELECT count(*) FROM file_catalog").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM file_embedding").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM vec_embedding").fetchone()[0] == 0
+
+
+def test_prune_before_retention_lets_a_restored_file_keep_its_embedding(tmp_path):
+    # The scenario _prune's docstring calls out by name: delete, prune
+    # (before the retention window), then restore the exact same content
+    # (a Trash restore, a re-added git-tracked file). A restore always gets
+    # a fresh mtime, so catalog.crawl treats it as "changed" and requeues it
+    # (content_hash cleared, status='pending') rather than leaving it
+    # untouched -- the payoff of keeping the embedding alive is enrich_one's
+    # dedup fast path (worker.py, "SELECT 1 FROM file_embedding WHERE
+    # content_hash = ?"): the restored content hashes identically, so it
+    # completes without ever calling the backend again. If prune had
+    # already deleted that embedding, this same restore would silently pay
+    # for a full re-embed instead of a free dedup hit.
+    from hunch import catalog, config as config_mod, db as db_mod
+    from hunch import worker as worker_mod
+    from tests.test_worker import StubBackend
+
+    root = tmp_path / "root"
+    root.mkdir()
+    cfg = config_mod.Config()
+    cfg.folders = [root]
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    f = root / "a.txt"
+    body = "a lease agreement for the flat"
+    f.write_text(body)
+    catalog.crawl(conn, cfg)
+    row = conn.execute(
+        "SELECT id, path, ext, size_bytes FROM file_catalog").fetchone()
+    worker_mod.enrich_one(conn, StubBackend(), cfg, row)
+
+    f.unlink()
+    catalog.crawl(conn, cfg)
+    cli._prune(conn)
+
+    f.write_text(body)          # byte-identical restore, fresh mtime
+    catalog.crawl(conn, cfg)
+
+    class BackendThatMustNotBeCalled(StubBackend):
+        def embed(self, texts):
+            raise AssertionError(
+                "dedup fast path should have skipped re-embedding")
+
+    row = conn.execute(
+        "SELECT id, path, ext, size_bytes FROM file_catalog").fetchone()
+    status = worker_mod.enrich_one(conn, BackendThatMustNotBeCalled(), cfg, row)
+
+    assert status == "done"
+    assert conn.execute("SELECT count(*) FROM file_embedding").fetchone()[0] == 1
+
+
+def test_prune_does_not_orphan_a_hash_still_held_by_an_unpurged_tombstone_during_a_rename(
+        tmp_path):
+    # Models the other scenario the docstring calls out: a move/rename
+    # tombstones the old path and inserts a new row for the new path in the
+    # SAME crawl, but the new row's content_hash starts out NULL until the
+    # worker gets to it. If prune runs in that gap, the *only* thing keeping
+    # the shared embedding alive is the old row's still-unpurged tombstone --
+    # it must not be treated as "doesn't count."
+    from hunch import catalog, config as config_mod, db as db_mod
+    from hunch import worker as worker_mod
+    from tests.test_worker import StubBackend
+
+    root = tmp_path / "root"
+    root.mkdir()
+    cfg = config_mod.Config()
+    cfg.folders = [root]
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    old = root / "old.txt"
+    old.write_text("a lease agreement for the flat")
+    catalog.crawl(conn, cfg)
+    row = conn.execute(
+        "SELECT id, path, ext, size_bytes FROM file_catalog").fetchone()
+    worker_mod.enrich_one(conn, StubBackend(), cfg, row)
+
+    new = root / "new.txt"
+    old.rename(new)
+    catalog.crawl(conn, cfg)    # tombstones old.txt, inserts new.txt pending
+
+    cli._prune(conn)            # runs before the worker reaches new.txt
+
+    assert conn.execute("SELECT count(*) FROM file_embedding").fetchone()[0] == 1
+    new_status = conn.execute(
+        "SELECT status FROM file_catalog WHERE filename='new.txt'").fetchone()[0]
+    assert new_status == "pending"
