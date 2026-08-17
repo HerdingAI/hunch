@@ -125,11 +125,19 @@ def crawl(conn, cfg: Config, folders: list[Path] | None = None) -> dict:
                 changed = (old_size != size) or (old_mtime != mtime)
                 if changed:
                     # Clear the hash too: a changed file is different content,
-                    # so its old embedding must not be reused.
+                    # so its old embedding must not be reused. retry_count
+                    # resets too -- new content deserves a fresh retry
+                    # budget, not one still carrying failures against
+                    # whatever the file used to contain (and worker.py's
+                    # _phase_pending_rows cooldown gates purely on
+                    # retry_count > 0, so a stale nonzero count here would
+                    # wrongly delay enriching content that was never even
+                    # attempted).
                     conn.execute(
                         "UPDATE file_catalog SET size_bytes=?, mtime=?, "
                         "status=?, content_hash=NULL, error_reason=NULL, "
-                        "deleted_at=NULL, last_seen=unixepoch() WHERE id=?",
+                        "deleted_at=NULL, retry_count=0, last_seen=unixepoch() "
+                        "WHERE id=?",
                         (size, mtime, status, fid))
                 else:
                     # A file stuck at 'failed' from a bounded run of

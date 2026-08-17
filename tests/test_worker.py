@@ -88,6 +88,70 @@ def test_missing_file_fails_without_tombstoning_once_retries_exhausted(tmp_path)
     assert deleted_at is None      # the worker never decides deletion, only crawl does
 
 
+def test_content_failure_increments_retry_count(tmp_path):
+    # Regression test for a real bug: _finish() never touched retry_count,
+    # so a content failure (bad extraction, no text, embed error) stayed
+    # at retry_count=0 forever -- catalog.crawl's self-heal requeue
+    # ("WHEN status='failed' AND retry_count < max THEN 'pending'") never
+    # capped, meaning the file was re-extracted from scratch on every
+    # single crawl indefinitely, wasting real work with no bound.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "empty.txt"
+    f.write_text(" " * 30)     # extractable size, but no real content
+    row = _row(conn, str(f), "txt", f.stat().st_size)
+    status = worker.enrich_one(conn, StubBackend(), Config(), row)
+    assert status == "failed"
+    retry_count = conn.execute(
+        "SELECT retry_count FROM file_catalog WHERE id=?", (row[0],)).fetchone()[0]
+    assert retry_count == 1
+
+
+def test_good_outcome_resets_a_stale_retry_count(tmp_path):
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "a.txt"
+    f.write_text("a lease agreement for the flat")
+    row = _row(conn, str(f), "txt", f.stat().st_size)
+    conn.execute("UPDATE file_catalog SET retry_count=2 WHERE id=?", (row[0],))
+    conn.commit()
+    status = worker.enrich_one(conn, StubBackend(), Config(), row)
+    assert status == "done"
+    retry_count = conn.execute(
+        "SELECT retry_count FROM file_catalog WHERE id=?", (row[0],)).fetchone()[0]
+    assert retry_count == 0
+
+
+def test_missing_file_does_not_burn_all_retries_within_one_run(tmp_path):
+    # Regression test for a real bug: enrich_one's missing-file branch sets
+    # status back to 'pending' so it can be retried later, but drain()'s
+    # own loop immediately reselected the same row again within the SAME
+    # run -- a persistently-missing file could exhaust all of
+    # cfg.max_enrich_retries's attempts in one pass instead of one attempt
+    # per run, permanently landing on status='failed' before the file even
+    # got a real chance to become available again across separate runs.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    cfg = Config()
+    _row(conn, str(tmp_path / "ghost.txt"), "txt", 50)
+    worker.run(conn, cfg, budget_seconds=5.0, backend=StubBackend())
+    status, retry_count = conn.execute(
+        "SELECT status, retry_count FROM file_catalog").fetchone()
+    assert status == "pending"
+    assert retry_count == 1
+    assert cfg.max_enrich_retries > 1     # otherwise this test proves nothing
+
+
+def test_changed_content_is_not_delayed_by_the_retry_cooldown(tmp_path):
+    # The cooldown that fixes the bug above must not also delay brand-new
+    # or freshly-changed content (always retry_count=0 the moment it
+    # becomes pending) -- only repeat attempts on already-failing content
+    # should ever wait.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "a.txt"
+    f.write_text("a lease agreement for the flat")
+    _row(conn, str(f), "txt", f.stat().st_size)
+    stats = worker.run(conn, Config(), budget_seconds=5.0, backend=StubBackend())
+    assert stats["counts"] == {"done": 1}
+
+
 def test_run_respects_the_time_budget(tmp_path):
     conn = db.connect(tmp_path / "i.db", dim=4)
     for i in range(20):

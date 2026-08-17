@@ -95,6 +95,31 @@ def test_recrawl_leaves_a_failed_file_alone_once_retry_cap_is_hit(tmp_path):
     assert conn.execute("SELECT status FROM file_catalog").fetchone()[0] == "failed"
 
 
+def test_recrawl_resets_retry_count_when_content_actually_changes(tmp_path):
+    # Regression test: a file that previously exhausted its retry cap
+    # (e.g. a corrupt PDF) must get a fresh retry budget once its content
+    # genuinely changes (e.g. the user re-saves it fixed) -- otherwise a
+    # stale retry_count inherited from the old content's failure history
+    # would wrongly delay enriching content that was never even attempted
+    # (worker.py's _phase_pending_rows cooldown gates on retry_count > 0).
+    f = tmp_path / "a.txt"
+    f.write_text("content behind a permanently broken extractor")
+    conn = _connect(tmp_path)
+    cfg = _cfg(tmp_path)
+    catalog.crawl(conn, cfg)
+    conn.execute("UPDATE file_catalog SET status='failed', retry_count=?",
+                 (cfg.max_enrich_retries,))
+    conn.commit()
+
+    time.sleep(0.01)
+    f.write_text("a completely different, working replacement")
+    catalog.crawl(conn, cfg)
+    status, retry_count = conn.execute(
+        "SELECT status, retry_count FROM file_catalog").fetchone()
+    assert status == "pending"
+    assert retry_count == 0
+
+
 def test_crawl_tombstones_deleted_files(tmp_path):
     f = tmp_path / "gone.txt"
     f.write_text("this file will be deleted shortly")

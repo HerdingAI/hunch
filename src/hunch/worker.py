@@ -47,10 +47,26 @@ def _finish(conn, fid, status, chash=None, reason=None):
     # No tombstone flag here by design: deletion is catalog.crawl()'s call
     # alone, made from an authoritative directory listing, never a judgment
     # the worker makes from a failed operation.
+    #
+    # retry_count moves here too: catalog.crawl()'s self-heal requeue
+    # ("WHEN status='failed' AND retry_count < max THEN 'pending'") only
+    # works if something actually increments retry_count on every failure.
+    # Before this, only enrich_one's missing-file branch did -- a content
+    # failure (bad PDF, no extractable text, embed error) left retry_count
+    # at 0 forever, so crawl requeued it every single run with no cap,
+    # burning real extraction work on an unfixable file indefinitely. A
+    # good terminal outcome resets the counter so a stale failure from
+    # long ago doesn't cost a fresh future failure any of its retry budget.
+    if status == "failed":
+        retry_expr = "retry_count + 1"
+    elif status in ("done", "skipped", "unsupported"):
+        retry_expr = "0"
+    else:
+        retry_expr = "retry_count"
     conn.execute(
-        "UPDATE file_catalog SET last_attempt = unixepoch(), status = ?, "
-        "content_hash = COALESCE(?, content_hash), error_reason = ? "
-        "WHERE id = ?",
+        f"UPDATE file_catalog SET last_attempt = unixepoch(), status = ?, "
+        f"content_hash = COALESCE(?, content_hash), error_reason = ?, "
+        f"retry_count = {retry_expr} WHERE id = ?",
         (status, chash, extract.clean_text(reason) or None, fid))
     conn.commit()
     return status
@@ -198,9 +214,23 @@ def _phase_pending_rows(conn, phase: str, batch: int):
             "ORDER BY c.size_bytes DESC LIMIT ?", (batch,)).fetchall()
     exts = budget_mod.phase_exts(phase)
     marks = ",".join("?" * len(exts))
+    # last_attempt cooldown, gated on retry_count > 0: a persistently-
+    # missing file's enrich_one call sets status back to 'pending' (see
+    # its missing-file branch) so it can be retried later -- without this
+    # floor, drain()'s own loop reselects it again within the same run,
+    # moments later, potentially burning all of cfg.max_enrich_retries's
+    # attempts in one pass. Gating on retry_count > 0 (rather than
+    # last_attempt alone) is what keeps this from also delaying brand-new
+    # or just-changed content, which is always retry_count=0 the moment
+    # it becomes pending and must be eligible immediately, not after a
+    # cooldown meant for repeat failures of the *same* content. 60s is
+    # far shorter than the hourly scheduled timer, so a genuine cross-run
+    # retry of already-failing content is unaffected.
     return conn.execute(
         f"SELECT id, path, ext, size_bytes FROM file_catalog "
         f"WHERE status='pending' AND deleted_at IS NULL AND ext IN ({marks}) "
+        f"AND (retry_count = 0 OR last_attempt IS NULL "
+        f"     OR last_attempt < unixepoch() - 60) "
         f"ORDER BY size_bytes ASC LIMIT ?", (*exts, batch)).fetchall()
 
 
