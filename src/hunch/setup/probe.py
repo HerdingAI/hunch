@@ -50,12 +50,22 @@ class Capabilities:
             summary = ("You are running fully local. Documents, images and audio "
                        "are all understood on this machine. Nothing is uploaded "
                        "and there is nothing to pay for.")
-        elif documents:
+        elif documents and image_text:
             summary = ("Documents and the text in your images will work well on "
                        "this machine — they run on the CPU. Describing photos in "
                        "detail needs a GPU with 4 GB or more, or an OpenRouter key; "
                        "audio and video transcription will work but may be slow "
                        "without a GPU.")
+        elif documents:
+            # poppler and tesseract are independent binaries -- one can be
+            # present without the other, so this must not claim image text
+            # works just because documents do.
+            summary = ("Documents will work well on this machine — they run on "
+                       "the CPU. Text within images won't be searchable until "
+                       "tesseract is installed: sudo apt install tesseract-ocr. "
+                       "Describing photos in detail needs a GPU with 4 GB or "
+                       "more, or an OpenRouter key; audio and video "
+                       "transcription will work but may be slow without a GPU.")
         else:
             summary = ("Install poppler-utils and tesseract-ocr to read documents: "
                        "sudo apt install poppler-utils tesseract-ocr")

@@ -37,6 +37,23 @@ def test_missing_tesseract_disables_image_text_only():
     assert v["photo_descriptions"] is True    # captioning needs no tesseract
 
 
+def test_missing_tesseract_summary_does_not_claim_image_text_works():
+    # Regression test for a real bug found via live testing: poppler and
+    # tesseract are independent binaries -- one can be present without the
+    # other (confirmed on a real machine: pdftotext found, tesseract
+    # missing) -- but the summary text's "elif documents:" branch only
+    # checked `documents`, so it told the user "the text in your images
+    # will work well" even when image_text was actually False.
+    caps = probe.Capabilities(has_gpu=True, vram_mb=4096, ram_mb=16384,
+                              free_disk_mb=80000, cpu_count=8,
+                              has_tesseract=False, has_poppler=True,
+                              has_ffmpeg=True)
+    v = caps.verdict()
+    assert "tesseract" in v["summary"].lower()
+    assert "text within images won't be searchable" in v["summary"].lower()
+    assert "text in your images will work" not in v["summary"].lower()
+
+
 def test_gpu_below_threshold_disables_only_photo_descriptions():
     caps = probe.Capabilities(has_gpu=True, vram_mb=2048, ram_mb=8192,
                               free_disk_mb=50000, cpu_count=4,
