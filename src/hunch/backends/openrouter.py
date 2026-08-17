@@ -5,12 +5,19 @@ import base64
 import json
 import mimetypes
 import os
+import shutil
+import subprocess
+import tempfile
 import urllib.request
 
 from ..config import Config
+from ..extract import FFMPEG_TIMEOUT
 from .base import Backend
 
 BASE = "https://openrouter.ai/api/v1"
+# Containers OpenRouter's /audio/transcriptions accepts directly. Video
+# containers are absent by design -- they must be demuxed to audio first.
+AUDIO_FORMATS = {"wav", "mp3", "flac", "m4a", "ogg", "webm", "aac"}
 
 
 def _keyring_get() -> str | None:
@@ -79,13 +86,58 @@ class OpenRouterBackend(Backend):
             return "", f"caption failed: {exc}"
 
     def transcribe(self, path: str) -> tuple[str, str]:
+        """Transcribe via OpenRouter's /audio/transcriptions endpoint.
+
+        Two things this has to get right that the obvious implementation
+        does not. The wire format is OpenRouter's own, not OpenAI's: a JSON
+        body carrying `input_audio: {data, format}`, where OpenAI would
+        take a multipart file upload. A body of `{"file": <base64>}` --
+        which is neither -- is silently rejected, so every audio and video
+        file fails with the backend set to openrouter.
+
+        And the bytes have to be audio. worker.py routes both audio and
+        video here, but the endpoint accepts audio containers only (wav,
+        mp3, flac, m4a, ogg, webm, aac), so an mp4 or mkv would be refused
+        even with the field names right. faster-whisper hides this for the
+        local backend by decoding video itself; over HTTP the decoding has
+        to happen on this side. Transcoding everything to mono 16 kHz mp3
+        handles video and audio through one path, guarantees `format`
+        matches the payload, and shrinks the base64 body by an order of
+        magnitude -- which matters, because the transfer counts against
+        the upstream provider's 60-second processing timeout.
+        """
+        audio_b64, fmt, err = self._audio_payload(path)
+        if err:
+            return "", err
         try:
-            with open(path, "rb") as fh:
-                b64 = base64.b64encode(fh.read()).decode()
             data = _post_json(f"{BASE}/audio/transcriptions",
                               {"model": self.cfg.openrouter_transcribe_model,
-                               "file": b64},
+                               "input_audio": {"data": audio_b64, "format": fmt}},
                               self.api_key(), timeout=900)
             return (data.get("text") or "").strip(), ""
         except Exception as exc:                   # noqa: BLE001
             return "", f"transcribe failed: {exc}"
+
+    def _audio_payload(self, path: str) -> tuple[str, str, str]:
+        """(base64, format, error). Prefers ffmpeg; falls back to raw bytes."""
+        if shutil.which("ffmpeg"):
+            with tempfile.TemporaryDirectory() as tmp:
+                out = os.path.join(tmp, "audio.mp3")
+                proc = subprocess.run(
+                    ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", path,
+                     "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", out],
+                    capture_output=True, text=True, timeout=FFMPEG_TIMEOUT,
+                    check=False)
+                if proc.returncode == 0 and os.path.exists(out):
+                    with open(out, "rb") as fh:
+                        return base64.b64encode(fh.read()).decode(), "mp3", ""
+                return "", "", f"transcribe failed: ffmpeg: {proc.stderr.strip()[:200]}"
+        # No ffmpeg: only already-supported audio containers can be sent as-is.
+        # Video without ffmpeg is genuinely unsupported here -- saying so beats
+        # uploading megabytes the endpoint will reject.
+        ext = os.path.splitext(path)[1].lstrip(".").lower()
+        if ext not in AUDIO_FORMATS:
+            return "", "", (f"transcribe failed: {ext or 'this file'} needs ffmpeg "
+                            f"to extract audio (sudo apt install ffmpeg)")
+        with open(path, "rb") as fh:
+            return base64.b64encode(fh.read()).decode(), ext, ""

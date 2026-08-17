@@ -49,6 +49,85 @@ def test_describe_image_uses_chat_completions_with_image_url(cfg, monkeypatch, t
     assert any(part["type"] == "image_url" for part in content)
 
 
+def test_transcribe_sends_openrouters_input_audio_shape_not_openais_file_field(
+        cfg, monkeypatch, tmp_path):
+    # Regression test for a real bug: the body was {"model": ..., "file":
+    # <base64>}, which is neither OpenRouter's schema nor OpenAI's. Verified
+    # against OpenRouter's live docs and API: the endpoint exists (nonsense
+    # paths 404, this one 401s without a key) and takes a JSON body with
+    # `input_audio: {data, format}` -- OpenAI's multipart `file` upload is a
+    # different API. With the wrong shape every audio and video file failed
+    # for anyone using the openrouter backend.
+    audio = tmp_path / "note.mp3"
+    audio.write_bytes(b"ID3" + b"\x00" * 64)
+    seen = {}
+
+    def fake_post(url, payload, key, timeout=120):
+        seen["url"] = url
+        seen["payload"] = payload
+        return {"text": "  the recorded words  "}
+
+    monkeypatch.setattr("hunch.backends.openrouter._post_json", fake_post)
+    # No ffmpeg: exercises the raw-passthrough path for an already-supported
+    # container, which must still use the documented field names.
+    monkeypatch.setattr("hunch.backends.openrouter.shutil.which", lambda n: None)
+
+    text, err = OpenRouterBackend(cfg).transcribe(str(audio))
+    assert err == ""
+    assert text == "the recorded words"
+    assert seen["url"].endswith("/audio/transcriptions")
+    assert "file" not in seen["payload"]              # OpenAI's shape, not this API's
+    assert seen["payload"]["input_audio"]["format"] == "mp3"
+    assert seen["payload"]["input_audio"]["data"]     # base64, non-empty
+
+
+def test_transcribe_demuxes_video_because_the_endpoint_takes_audio_only(
+        cfg, monkeypatch, tmp_path):
+    # worker.py routes video here too, but OpenRouter accepts audio
+    # containers only -- an .mp4 sent as-is is refused no matter how correct
+    # the field names are. ffmpeg must extract the audio first.
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"\x00\x00\x00 ftypmp42" + b"\x00" * 64)
+    seen = {}
+
+    monkeypatch.setattr("hunch.backends.openrouter._post_json",
+                        lambda url, payload, key, timeout=120: (
+                            seen.update(payload=payload) or {"text": "spoken"}))
+    monkeypatch.setattr("hunch.backends.openrouter.shutil.which",
+                        lambda n: "/usr/bin/ffmpeg")
+
+    class FakeProc:
+        returncode, stderr = 0, ""
+
+    def fake_run(cmd, **kw):
+        # ffmpeg must be told to drop video and produce the mp3 we claim.
+        assert "-vn" in cmd
+        open(cmd[-1], "wb").write(b"fake mp3 bytes")
+        return FakeProc()
+
+    monkeypatch.setattr("hunch.backends.openrouter.subprocess.run", fake_run)
+
+    text, err = OpenRouterBackend(cfg).transcribe(str(video))
+    assert err == ""
+    assert text == "spoken"
+    assert seen["payload"]["input_audio"]["format"] == "mp3"   # not "mp4"
+
+
+def test_transcribe_video_without_ffmpeg_says_so_instead_of_uploading_junk(
+        cfg, monkeypatch, tmp_path):
+    video = tmp_path / "clip.mkv"
+    video.write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 64)
+    posted = []
+    monkeypatch.setattr("hunch.backends.openrouter._post_json",
+                        lambda *a, **k: posted.append(1) or {"text": ""})
+    monkeypatch.setattr("hunch.backends.openrouter.shutil.which", lambda n: None)
+
+    text, err = OpenRouterBackend(cfg).transcribe(str(video))
+    assert text == ""
+    assert "ffmpeg" in err
+    assert posted == []            # never upload bytes the endpoint will reject
+
+
 def test_missing_key_is_a_clear_error(monkeypatch):
     monkeypatch.delenv("HUNCH_OPENROUTER_KEY", raising=False)
     monkeypatch.setattr("hunch.backends.openrouter._keyring_get", lambda: None)

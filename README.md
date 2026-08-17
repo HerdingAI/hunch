@@ -31,10 +31,15 @@ GB); `media` brings speech-to-text. Drop either if you don't want it — or
 drop both and run `hunch auth openrouter` to do the heavy lifting in the
 cloud instead.
 
-`hunch setup` checks your hardware, tells you plainly what will work, indexes
-your Documents, Downloads, Desktop and Pictures, and installs a background
-timer. Nothing else is required — there is no daemon to configure and no cron
-to write.
+`hunch setup` checks your hardware, tells you plainly what will work, picks
+the folders to index — Documents, Downloads, Desktop and Pictures — and
+starts a background timer that does the indexing from then on. Nothing else
+is required: there is no daemon to configure and no cron to write.
+
+Indexing runs in the background rather than making you wait, so results fill
+in over the first few hours rather than appearing all at once. `hunch status`
+shows how far along it is. To index right now instead of waiting for the
+timer, run `hunch index`.
 
 Press **Super+F** to search, or:
 
@@ -66,12 +71,22 @@ mains power and at idle priority.
 
 ## Privacy
 
-No telemetry, ever. With the default local backend, no network requests are
-made at all. Switching to OpenRouter sends the full text, photo, or audio
-content of whatever it's enriching to OpenRouter's API — `hunch auth
-openrouter` states this plainly and asks for confirmation before storing a
-key. The index is a single SQLite file at `~/.local/share/hunch/index.db`,
-created owner-only-readable — delete it and nothing remains.
+No telemetry, ever. With the default local backend, the contents of your
+files never leave the machine — reading, transcribing and embedding all
+happen locally.
+
+The one thing that does use the network is downloading the models
+themselves, from Hugging Face, the first time each is needed (they are not
+shipped with the package — see `NOTICE`). That transfer sends no data about
+you or your files, and once a model is cached nothing further is fetched.
+
+Switching to OpenRouter is the deliberate exception: it sends the full text,
+photo, or audio content of whatever it's enriching to OpenRouter's API.
+`hunch auth openrouter` states this plainly and asks for confirmation before
+storing a key.
+
+The index is a single SQLite file at `~/.local/share/hunch/index.db`, created
+owner-only-readable — delete it and nothing remains.
 
 ## License
 
