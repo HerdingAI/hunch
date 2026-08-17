@@ -298,3 +298,47 @@ def test_genuinely_bad_files_do_not_stop_a_run_that_is_working(tmp_path):
 
     stats = worker.run(conn, Config(), budget_seconds=30.0, backend=StubBackend())
     assert stats["counts"].get("done") == 1        # the good one still landed
+
+
+def test_silence_is_skipped_not_failed(tmp_path):
+    # Found live: a synthetic tone and a silent video both transcribed fine
+    # and were marked 'failed' for containing no speech. An image with no
+    # OCR text a few lines away in the same function lands on 'skipped',
+    # and the spec is explicit about why the distinction exists -- "skipped
+    # is distinct from failed on purpose... conflating them would corrupt
+    # the failure-rate signal". Instrumental music, ambient video and
+    # silent screen recordings are content facts, not errors.
+    #
+    # It costs work too: catalog.crawl requeues failed files under the
+    # retry cap, so every silent file was re-transcribed on each crawl
+    # until it exhausted its retries.
+    class SilentBackend(StubBackend):
+        def transcribe(self, path):
+            return "", ""                  # transcribed fine, nothing said
+
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "instrumental.mp3"
+    f.write_bytes(b"ID3" + b"\x00" * 400)
+    row = _row(conn, str(f), "mp3", f.stat().st_size)
+
+    assert worker.enrich_one(conn, SilentBackend(), Config(), row) == "skipped"
+    status, reason, retries = conn.execute(
+        "SELECT status, error_reason, retry_count FROM file_catalog "
+        "WHERE id=?", (row[0],)).fetchone()
+    assert status == "skipped"
+    assert "no speech" in reason
+    assert retries == 0            # a scope decision must not burn retries
+
+
+def test_a_real_transcription_failure_is_still_a_failure(tmp_path):
+    # The distinction must stay sharp in the other direction: a backend
+    # that could not transcribe at all is an error, not a content fact.
+    class BrokenBackend(StubBackend):
+        def transcribe(self, path):
+            return "", "transcribe failed: model could not load"
+
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "speech.mp3"
+    f.write_bytes(b"ID3" + b"\x00" * 400)
+    row = _row(conn, str(f), "mp3", f.stat().st_size)
+    assert worker.enrich_one(conn, BrokenBackend(), Config(), row) == "failed"

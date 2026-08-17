@@ -183,7 +183,17 @@ def enrich_one(conn, backend, cfg: Config, row) -> str:
         text, err = backend.transcribe(path)
         _timing(conn, kind, "transcribe", time.time() - t0, size)
         if not err and not text.strip():
-            err = "no speech detected"
+            # Transcription worked and there was simply nothing said --
+            # instrumental music, ambient video, a silent screen capture.
+            # That is a fact about the content, exactly like an image with
+            # no OCR text a few lines above, which is why it lands on
+            # 'skipped' rather than 'failed'. The spec is explicit that
+            # conflating the two "would corrupt the failure-rate signal",
+            # and it also costs real work: catalog.crawl requeues failed
+            # files under the retry cap, so every silent file would be
+            # re-transcribed on each crawl until it exhausted its retries.
+            return _finish(conn, fid, "skipped", chash=chash,
+                           reason="no speech detected")
 
     text = extract.clean_text(text)
     if err or not text.strip():
