@@ -1,3 +1,4 @@
+import sys
 import pytest
 
 from hunch.backends import base, get_backend
@@ -160,3 +161,42 @@ def test_embed_does_not_loop_when_cpu_also_fails(monkeypatch):
         assert False, "expected the error to surface"
     except RuntimeError as exc:
         assert "still broken" in str(exc)
+
+
+def test_release_collects_cycles_so_the_memory_is_actually_freed(monkeypatch):
+    # Regression test for a bug that made every existing release() call a
+    # no-op. Dropping the model references is not enough: torch models hold
+    # reference cycles, so the tensors stay alive until a collection runs
+    # and empty_cache() finds nothing to reclaim. Measured on a real GPU --
+    # 2,296 MiB reserved after load, still 2,296 MiB after release(), and
+    # 20 MiB once gc.collect() ran first.
+    #
+    # This silently disabled the GUI's idle release and worker.drain()'s
+    # release between stage phases, which is what keeps Whisper and the
+    # vision model off a 4 GB card at the same time. The earlier test for
+    # that fix asserted release() was *called*, which it always was -- the
+    # call just did nothing.
+    from hunch.backends.local_inprocess import LocalBackend
+    from hunch.config import Config
+
+    order = []
+    b = LocalBackend.__new__(LocalBackend)
+    b.cfg = Config()
+    b.device = "cuda"
+    b._embedder = object()
+    b._vision = b._vision_proc = b._whisper = None
+
+    import gc as real_gc
+    monkeypatch.setattr(real_gc, "collect", lambda *a: order.append("gc") or 0)
+
+    fake_torch = type(sys)("torch")
+    fake_torch.cuda = type("cuda", (), {
+        "empty_cache": staticmethod(lambda: order.append("empty_cache"))})
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    b.release()
+
+    assert b._embedder is None
+    # Order matters: collecting after empty_cache() would free the cycles
+    # too late for that call to reclaim anything.
+    assert order == ["gc", "empty_cache"]

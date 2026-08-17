@@ -200,9 +200,26 @@ class LocalBackend(Backend):
         return text, err
 
     def release(self) -> None:
+        """Actually give the VRAM back.
+
+        Dropping the references is not enough. Torch models hold reference
+        cycles, so the tensors stay alive until a collection runs, and
+        empty_cache() then has nothing to reclaim. Measured: 2,296 MiB
+        reserved after load, still 2,296 MiB after dropping the refs and
+        calling empty_cache(), and 20 MiB once gc.collect() ran first.
+
+        Everything that relies on this was therefore a no-op: the GUI's
+        idle release ("so the app does not sit on hundreds of megabytes
+        indefinitely") and worker.drain()'s release between stage phases,
+        which exists so Whisper and the vision model never occupy a 4 GB
+        card at the same time.
+        """
         self._embedder = self._vision = self._vision_proc = self._whisper = None
         try:
+            import gc
+
             import torch
+            gc.collect()
             if self.device == "cuda":
                 torch.cuda.empty_cache()
         except Exception:                          # noqa: BLE001
