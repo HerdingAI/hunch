@@ -380,6 +380,41 @@ def test_reindex_embeddings_survives_a_failed_row(tmp_path, monkeypatch):
     assert db_mod.get_meta(conn, "embed_model") == seed_backend.model_id
 
 
+def test_reindex_rebuilds_the_vector_table_when_the_dimension_changes(
+        tmp_path, monkeypatch):
+    # Regression test for a real bug: vec0 fixes dimensionality at CREATE
+    # and db.connect uses IF NOT EXISTS, so changing embed_dim left the old
+    # table in place and every insert failed with "Dimension mismatch" --
+    # including this command, which is exactly what the mismatch message
+    # tells people to run. There was no way out of a dim change at all.
+    from hunch import config as config_mod, db as db_mod, worker as worker_mod
+    from tests.test_worker import StubBackend
+
+    cfg = config_mod.Config()
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "doc.txt"
+    f.write_text("a lease agreement")
+    conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                 "VALUES (?,?,?,?,'pending')", (str(f), "doc.txt", "txt", f.stat().st_size))
+    conn.commit()
+    row = conn.execute("SELECT id, path, ext, size_bytes FROM file_catalog").fetchone()
+    worker_mod.enrich_one(conn, StubBackend(), cfg, row)
+    assert db_mod.vec_dim(conn) == 4
+
+    class WiderBackend(StubBackend):
+        model_id, dim = "wider", 8
+
+        def embed(self, texts):
+            return [[0.5] * 8 for _ in texts]
+
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+    monkeypatch.setattr(cli, "get_backend", lambda cfg: WiderBackend())
+
+    assert cli.main(["reindex", "--embeddings"]) == 0
+    assert db_mod.vec_dim(conn) == 8
+    assert conn.execute("SELECT count(*) FROM vec_embedding").fetchone()[0] == 1
+
+
 def test_prune_leaves_a_fresh_tombstones_embedding_alone(tmp_path):
     # Regression test for a real bug: _prune's orphan-detection queries
     # filtered on deleted_at IS NULL, so a file tombstoned this second (not

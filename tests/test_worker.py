@@ -152,6 +152,46 @@ def test_changed_content_is_not_delayed_by_the_retry_cooldown(tmp_path):
     assert stats["counts"] == {"done": 1}
 
 
+def test_stage_models_are_released_so_whisper_and_vision_never_stack(tmp_path):
+    # Regression test for a real bug: local_inprocess.py's stated premise is
+    # that "a 4 GB card cannot hold the embedder, the vision model and
+    # Whisper at once", but nothing ever called release() during a run --
+    # only the GUI's idle timer did. `audio` (Whisper) runs immediately
+    # before `image_caption` (vision) with the embedder resident throughout,
+    # so on the 4 GB card the project targets all three stacked.
+    released = []
+
+    class TrackingBackend(StubBackend):
+        def release(self):
+            released.append(True)
+
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "note.mp3"
+    f.write_bytes(b"ID3" + b"\x00" * 200)
+    _row(conn, str(f), "mp3", f.stat().st_size)
+
+    worker.run(conn, Config(), budget_seconds=5.0, backend=TrackingBackend())
+    assert released, "audio phase must free Whisper before the next phase loads"
+
+
+def test_embedder_only_phases_do_not_pay_a_pointless_reload(tmp_path):
+    # The flip side: `document` and `image_meta` use the embedder alone, so
+    # releasing after them would just re-pay the load cost for no VRAM win.
+    released = []
+
+    class TrackingBackend(StubBackend):
+        def release(self):
+            released.append(True)
+
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    f = tmp_path / "a.txt"
+    f.write_text("a lease agreement for the flat")
+    _row(conn, str(f), "txt", f.stat().st_size)
+
+    worker.run(conn, Config(), budget_seconds=5.0, backend=TrackingBackend())
+    assert released == []
+
+
 def test_run_respects_the_time_budget(tmp_path):
     conn = db.connect(tmp_path / "i.db", dim=4)
     for i in range(20):

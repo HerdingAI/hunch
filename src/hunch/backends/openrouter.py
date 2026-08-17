@@ -12,7 +12,7 @@ import urllib.request
 
 from ..config import Config
 from ..extract import FFMPEG_TIMEOUT
-from .base import Backend
+from .base import Backend, check_dim
 
 BASE = "https://openrouter.ai/api/v1"
 # Containers OpenRouter's /audio/transcriptions accepts directly. Video
@@ -64,7 +64,9 @@ class OpenRouterBackend(Backend):
                           {"model": self.cfg.openrouter_embed_model,
                            "input": [t[:8000] for t in texts]},
                           self.api_key())
-        return [row["embedding"] for row in data["data"]]
+        vectors = [row["embedding"] for row in data["data"]]
+        check_dim(vectors, self.dim, self.cfg.openrouter_embed_model)
+        return vectors
 
     def describe_image(self, path: str) -> tuple[str, str]:
         try:

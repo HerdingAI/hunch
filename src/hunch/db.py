@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import struct
 from pathlib import Path
@@ -81,6 +82,32 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+    conn.commit()
+
+
+def vec_dim(conn: sqlite3.Connection) -> int | None:
+    """The dimension vec_embedding was actually created with, or None."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE name = 'vec_embedding'").fetchone()
+    if not row or not row[0]:
+        return None
+    found = re.search(r"float\s*\[\s*(\d+)\s*\]", row[0])
+    return int(found.group(1)) if found else None
+
+
+def recreate_vec_table(conn: sqlite3.Connection, dim: int) -> None:
+    """Rebuild vec_embedding at a new dimension.
+
+    vec0 fixes dimensionality at CREATE time, and connect() uses IF NOT
+    EXISTS -- so changing embed_dim otherwise leaves the old table in place
+    and every insert fails with "Dimension mismatch", including the
+    `hunch reindex --embeddings` run meant to recover. Dropping loses
+    nothing: vectors of the wrong dimension are unusable by definition, and
+    reindex regenerates all of them from the text it kept.
+    """
+    conn.execute("DROP TABLE IF EXISTS vec_embedding")
+    conn.execute(
+        f"CREATE VIRTUAL TABLE vec_embedding USING vec0(embedding float[{dim}])")
     conn.commit()
 
 

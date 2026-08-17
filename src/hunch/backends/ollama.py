@@ -10,7 +10,7 @@ import json
 import urllib.request
 
 from ..config import Config
-from .base import Backend
+from .base import Backend, check_dim
 
 
 def _post(url: str, payload: dict, timeout: int = 300) -> dict:
@@ -32,7 +32,9 @@ class OllamaBackend(Backend):
     def embed(self, texts: list[str]) -> list[list[float]]:
         data = _post(f"{self.url}/api/embed",
                      {"model": self.model_id, "input": [t[:8000] for t in texts]})
-        return data["embeddings"]
+        vectors = data["embeddings"]
+        check_dim(vectors, self.dim, self.model_id)
+        return vectors
 
     def describe_image(self, path: str) -> tuple[str, str]:
         try:

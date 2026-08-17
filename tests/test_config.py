@@ -28,6 +28,20 @@ def test_roundtrip_preserves_values(tmp_path):
     assert again.folders == [tmp_path / "a", tmp_path / "b"]
 
 
+def test_unknown_keys_in_an_existing_config_are_ignored(tmp_path):
+    # save_config writes every field, so a config written by an older
+    # version can name keys this one no longer has -- image_caption_above
+    # was exactly that: a knob nothing ever read, removed rather than
+    # left lying to users. Upgrading past it must not break the install.
+    path = tmp_path / "config.toml"
+    path.write_text('backend = "local_inprocess"\n'
+                    'image_caption_above = 512000\n'
+                    'some_future_key = "whatever"\n')
+    cfg = c.load_config(path)
+    assert cfg.backend == "local_inprocess"
+    assert not hasattr(cfg, "image_caption_above")
+
+
 def test_classify_routes_extensions():
     assert c.classify("pdf") == "document"
     assert c.classify("eml") == "document"

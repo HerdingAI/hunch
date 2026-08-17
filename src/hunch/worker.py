@@ -18,6 +18,10 @@ from .config import Config, classify
 
 QUICK_HASH_THRESHOLD = 8 * 1024 * 1024
 BATCH = 50
+# Phases that load a heavy model of their own on top of the embedder --
+# Whisper for `audio`, the vision model for `image_caption`. Released when
+# the phase ends so the two never stack (see drain()'s finally block).
+STAGE_MODEL_PHASES = {"audio", "image_caption"}
 
 
 def content_hash(path: str, size: int) -> tuple[str | None, str]:
@@ -304,16 +308,30 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
     def drain(phase, phase_budget) -> bool:
         """Process `phase` until phase_budget or the overall budget runs out,
         or its queue runs dry. Returns True if `limit` was hit."""
-        while not phase_budget.exhausted() and not overall.exhausted():
-            rows = _phase_pending_rows(conn, phase, BATCH)
-            if not rows:
-                return False
-            for item in rows:
-                if phase_budget.exhausted() or overall.exhausted():
+        try:
+            while not phase_budget.exhausted() and not overall.exhausted():
+                rows = _phase_pending_rows(conn, phase, BATCH)
+                if not rows:
                     return False
-                if process(phase, item):
-                    return True
-        return False
+                for item in rows:
+                    if phase_budget.exhausted() or overall.exhausted():
+                        return False
+                    if process(phase, item):
+                        return True
+            return False
+        finally:
+            # Free the stage model this phase loaded before the next phase
+            # loads its own. local_inprocess.py's own premise is that "a 4 GB
+            # card cannot hold the embedder, the vision model and Whisper at
+            # once" -- but nothing released them, and `audio` (Whisper) runs
+            # immediately before `image_caption` (vision) with the embedder
+            # resident throughout, which is precisely that three-way pileup.
+            # Only these two phases hold a heavy stage model; `document` and
+            # `image_meta` use the embedder alone, so releasing after them
+            # would just re-pay the reload for nothing. In a `finally` so an
+            # early return on an exhausted budget frees VRAM too.
+            if phase in STAGE_MODEL_PHASES:
+                backend.release()
 
     leading = budget_mod.next_phase(conn)
     if leading is None:

@@ -9,6 +9,28 @@ from __future__ import annotations
 import abc
 
 
+def check_dim(vectors: list[list[float]], expected: int, model_id: str) -> None:
+    """Fail loudly when a remote model's real width isn't the configured one.
+
+    local_inprocess passes truncate_dim to the model, so its vectors are the
+    configured width by construction. A remote API just returns whatever its
+    model produces: config says 1024, the model returns 2560, and the
+    mismatch only surfaces several layers down as sqlite-vec's "Dimension
+    mismatch for inserted vector" -- once per file, from a stack that names
+    neither the backend, the model, nor the fix. Raising here turns that
+    into one actionable sentence.
+    """
+    if not vectors:
+        return
+    actual = len(vectors[0])
+    if actual != expected:
+        raise RuntimeError(
+            f"{model_id} returns {actual}-dimensional vectors but this index "
+            f"expects {expected}. Set embed_dim = {actual} in the config file "
+            f"(hunch doctor prints its path) and run "
+            f"`hunch reindex --embeddings`.")
+
+
 class Backend(abc.ABC):
     #: Identifies the vector space. Stored in the index and compared on open.
     model_id: str = ""

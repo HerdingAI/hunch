@@ -16,6 +16,7 @@ def cfg(monkeypatch):
 
 def test_embed_posts_to_embeddings_endpoint(cfg, monkeypatch):
     seen = {}
+    cfg.embed_dim = 3          # match the stub's width; see the dim test below
 
     def fake_post(url, payload, key, timeout=120):
         seen["url"] = url
@@ -47,6 +48,25 @@ def test_describe_image_uses_chat_completions_with_image_url(cfg, monkeypatch, t
     assert seen["url"].endswith("/chat/completions")
     content = seen["payload"]["messages"][0]["content"]
     assert any(part["type"] == "image_url" for part in content)
+
+
+def test_wrong_width_from_a_remote_model_names_the_fix(cfg, monkeypatch):
+    # Regression test for a real bug: remote backends set self.dim from
+    # config and never checked what the API actually returned. local
+    #_inprocess passes truncate_dim so its vectors match by construction, but
+    # a remote model just returns its own width. The mismatch surfaced only
+    # as sqlite-vec's "Dimension mismatch for inserted vector", once per
+    # file, from a stack naming neither the backend, the model, nor the fix.
+    cfg.embed_dim = 1024
+    monkeypatch.setattr(
+        "hunch.backends.openrouter._post_json",
+        lambda url, payload, key, timeout=120: {"data": [{"embedding": [0.1] * 2560}]})
+
+    with pytest.raises(RuntimeError) as exc:
+        OpenRouterBackend(cfg).embed(["a"])
+    msg = str(exc.value)
+    assert "2560" in msg and "1024" in msg          # both widths, so it's diagnosable
+    assert "reindex --embeddings" in msg            # and the actual way out
 
 
 def test_transcribe_sends_openrouters_input_audio_shape_not_openais_file_field(

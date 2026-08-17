@@ -108,7 +108,6 @@ class Config:
     first_run_budget_seconds: int = 5 * 3600
     daily_budget_seconds: int = 20 * 60
     image_skip_below: int = 20 * 1024
-    image_caption_above: int = 500 * 1024
     # A file that's missing at enrichment time might be genuinely deleted, or
     # might just be a transient permission error or a stale network handle --
     # they look identical from here. Deletion is catalog.crawl()'s call

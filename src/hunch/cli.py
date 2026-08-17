@@ -324,6 +324,17 @@ def cmd_reindex(args) -> int:
         # every future `hunch index` run forever, including a second
         # `hunch reindex --embeddings` attempt.
         backend = get_backend(cfg)
+        # A dimension change has no in-place migration: vec0 fixes
+        # dimensionality at CREATE and db.connect() uses IF NOT EXISTS, so
+        # without this every insert below fails with "Dimension mismatch" --
+        # including this command, the one the mismatch message tells people
+        # to run. Rebuilding all vectors is exactly what this command does,
+        # so recreating the table costs nothing extra.
+        current_dim = db.vec_dim(conn)
+        if current_dim is not None and current_dim != backend.dim:
+            print(f"embedding dimension changed ({current_dim} -> {backend.dim}); "
+                  f"rebuilding the vector table")
+            db.recreate_vec_table(conn, backend.dim)
         rows = conn.execute(
             "SELECT rowid, content_hash, extracted_text FROM file_embedding").fetchall()
         rebuilt = failed = 0
