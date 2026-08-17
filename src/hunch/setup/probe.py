@@ -6,6 +6,7 @@ audio alone.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -128,3 +129,30 @@ def on_ac_power() -> bool:
         except OSError:
             continue
     return not found_mains
+
+
+def local_backend_importable() -> bool:
+    """Whether the local_inprocess backend's embedding dependency (the
+    `local` extra) is actually installed -- distinct from has_gpu/
+    has_tesseract/etc above, which probe system binaries, not Python
+    packages. `pipx install hunch-search` with no extras passes every
+    hardware check and then silently fails every single file at embed
+    time (worker.py's broad except around backend.embed()), leaving only
+    an error_reason buried in a DB column no one looks at.
+
+    find_spec, not a real import: sentence_transformers pulls in torch,
+    which costs real seconds to load -- a presence check must not pay
+    that just to answer "is this installed".
+    """
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
+def media_importable() -> bool:
+    """Whether faster-whisper (the `media` extra) is installed. Needed by
+    both the local_inprocess and ollama backends (ollama.py: "Ollama does
+    not serve speech-to-text, so transcription falls back to
+    faster-whisper") -- only the openrouter backend transcribes without
+    it. Same silent-failure shape as local_backend_importable(), scoped to
+    audio/video files instead of every file.
+    """
+    return importlib.util.find_spec("faster_whisper") is not None

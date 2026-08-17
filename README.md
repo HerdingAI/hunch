@@ -12,7 +12,7 @@ Everything runs on your machine by default. Nothing is uploaded.
 
 ```bash
 sudo apt install pipx poppler-utils tesseract-ocr ffmpeg
-pipx install hunch-search
+pipx install "hunch-search[local,gui,media]"
 hunch setup
 ```
 

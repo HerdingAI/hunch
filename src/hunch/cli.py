@@ -51,16 +51,39 @@ def cmd_setup(args) -> int:
         cfg.embed_model = "Qwen/Qwen3-Embedding-4B"
     config.save_config(cfg)
 
+    # A `pipx install hunch-search` with no extras passes every hardware
+    # check above and then silently fails every single file at embed time
+    # -- catch it here, loudly, before the timer starts running forever
+    # against nothing.
+    deps_ok = cfg.backend != "local_inprocess" or probe.local_backend_importable()
+    if not deps_ok:
+        print(
+            "\nWARNING: the local embedding backend's Python packages are not "
+            "installed -- every file would fail to index until this is fixed.\n"
+            '  pipx install --force "hunch-search[local]"\n'
+            "or run `hunch auth openrouter` to use a cloud backend instead.")
+
     print("Folders to index:")
     for folder in cfg.folders:
         print(f"  {folder}")
-    install.install_user_units()
+    try:
+        install.install_user_units()
+        timer_ok = True
+    except RuntimeError as exc:
+        # The timer is the *only* thing that ever triggers enrichment --
+        # claiming success here when it silently failed to enable would
+        # tell the user everything works while nothing ever indexes.
+        timer_ok = False
+        print(f"\nWARNING: could not install the background indexing timer: {exc}")
+        print("Run `hunch index` manually to index without it.")
     install.install_launcher()
     install.install_nautilus_script()
     bound = install.bind_shortcut()
-    print("\nInstalled: background indexing timer, app launcher, Nautilus script")
+    print("\nInstalled: " + ("background indexing timer, " if timer_ok else "") +
+          "app launcher, Nautilus script")
     print("Shortcut:  " + ("Super+F" if bound else "not set (GNOME not detected)"))
-    print("\nNothing else is required. Indexing starts automatically.")
+    if timer_ok and deps_ok:
+        print("\nNothing else is required. Indexing starts automatically.")
     return 0
 
 
@@ -250,6 +273,20 @@ def cmd_doctor(args) -> int:
     for name, ok in (("pdftotext", caps.has_poppler), ("tesseract", caps.has_tesseract),
                      ("ffmpeg", caps.has_ffmpeg)):
         print(f"  {name:14} {'found' if ok else 'MISSING'}")
+
+    # Distinct from the system-binary checks above: these are the Python
+    # extras (`pip install hunch-search[...]`), missing which the affected
+    # files fail silently at embed/transcribe time instead of a visible
+    # crash -- see probe.local_backend_importable's docstring.
+    cfg = config.load_config()
+    print("\nPython packages")
+    if cfg.backend == "local_inprocess":
+        ok = probe.local_backend_importable()
+        print(f"  local embedding {'found' if ok else 'MISSING -- pipx install \"hunch-search[local]\"'}")
+    if cfg.backend != "openrouter":
+        ok = probe.media_importable()
+        print(f"  audio/video     {'found' if ok else 'MISSING -- pipx install \"hunch-search[media]\"'}")
+
     print("\nWhat works")
     for key in ("documents", "image_text", "photo_descriptions", "transcription"):
         print(f"  {key:20} {'yes' if verdict[key] else 'no'}")

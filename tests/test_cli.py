@@ -26,6 +26,11 @@ def test_search_with_no_results_returns_nonzero(capsys, monkeypatch):
 
 def test_doctor_reports_capabilities(capsys, monkeypatch):
     monkeypatch.setattr(cli, "_open", lambda: (object(), object()))
+    # Hermetic: this machine's real dev-venv package set must never decide
+    # what this test asserts.
+    monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
+    monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: True)
+    monkeypatch.setattr(cli.probe, "media_importable", lambda: True)
     rc = cli.main(["doctor"])
     out = capsys.readouterr().out.lower()
     assert rc == 0
@@ -155,6 +160,89 @@ def test_scheduled_index_spends_first_run_budget_until_backlog_clears(tmp_path, 
 
     assert seen_budgets == [100, 60, 20, 20]
     assert db_mod.get_meta(conn, "first_pass_done") == "1"
+
+
+def test_setup_reports_a_failed_timer_install_instead_of_claiming_success(
+        tmp_path, monkeypatch, capsys):
+    # Regression test for a real bug: install_user_units() failures (no
+    # systemctl, or `enable --now` erroring) were never surfaced -- cmd_setup
+    # claimed "Nothing else is required. Indexing starts automatically" even
+    # though the *only* thing that ever triggers enrichment never got
+    # installed, leaving a "successfully installed" system that silently
+    # never indexes anything.
+    from hunch.setup.probe import Capabilities
+
+    fake_caps = Capabilities(has_gpu=False, vram_mb=0, ram_mb=8000,
+                             free_disk_mb=50000, cpu_count=4,
+                             has_tesseract=True, has_poppler=True, has_ffmpeg=True)
+    monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
+    monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: True)
+    monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
+    monkeypatch.setattr(cli.config, "save_config", lambda cfg: None)
+    monkeypatch.setattr(
+        cli.install, "install_user_units",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("systemctl --user enable --now hunch-index.timer "
+                        "failed: exit code 1")))
+    monkeypatch.setattr(cli.install, "install_launcher", lambda: tmp_path / "x.desktop")
+    monkeypatch.setattr(cli.install, "install_nautilus_script", lambda: tmp_path / "script")
+    monkeypatch.setattr(cli.install, "bind_shortcut", lambda: False)
+
+    rc = cli.main(["setup"])
+    out = capsys.readouterr().out
+    assert rc == 0                                     # not a hard failure
+    assert "could not install the background indexing timer" in out
+    assert "Nothing else is required" not in out
+
+
+def test_setup_warns_instead_of_claiming_success_when_embedding_deps_are_missing(
+        tmp_path, monkeypatch, capsys):
+    # Regression test for a real bug: `pipx install hunch-search` with no
+    # extras passes every hardware check in cmd_setup and then silently
+    # fails every single file at embed time -- the only trace was an
+    # error_reason buried in a DB column. cmd_setup must say so up front,
+    # in the terminal the user is already looking at, and must not claim
+    # "Nothing else is required" when nothing will actually work.
+    from hunch.setup.probe import Capabilities
+
+    fake_caps = Capabilities(has_gpu=False, vram_mb=0, ram_mb=8000,
+                             free_disk_mb=50000, cpu_count=4,
+                             has_tesseract=True, has_poppler=True, has_ffmpeg=True)
+    monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
+    monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: False)
+    monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
+    monkeypatch.setattr(cli.config, "save_config", lambda cfg: None)
+    monkeypatch.setattr(cli.install, "install_user_units", lambda: [])
+    monkeypatch.setattr(cli.install, "install_launcher", lambda: tmp_path / "x.desktop")
+    monkeypatch.setattr(cli.install, "install_nautilus_script", lambda: tmp_path / "script")
+    monkeypatch.setattr(cli.install, "bind_shortcut", lambda: False)
+
+    rc = cli.main(["setup"])
+    out = capsys.readouterr().out
+    assert rc == 0                                     # not a hard failure
+    assert 'pipx install --force "hunch-search[local]"' in out
+    assert "Nothing else is required" not in out
+    # The timer itself installed fine -- only the embedding deps are the
+    # problem, so this warning must not be mistaken for the timer one.
+    assert "could not install the background indexing timer" not in out
+
+
+def test_doctor_flags_a_missing_local_embedding_dependency(monkeypatch, capsys):
+    from hunch.setup.probe import Capabilities
+
+    fake_caps = Capabilities(has_gpu=False, vram_mb=0, ram_mb=8000,
+                             free_disk_mb=50000, cpu_count=4,
+                             has_tesseract=True, has_poppler=True, has_ffmpeg=True)
+    monkeypatch.setattr(cli, "_open", lambda: (object(), object()))
+    monkeypatch.setattr(cli.probe, "probe", lambda: fake_caps)
+    monkeypatch.setattr(cli.probe, "local_backend_importable", lambda: False)
+    monkeypatch.setattr(cli.probe, "media_importable", lambda: True)
+    monkeypatch.setattr(cli.config, "load_config", lambda: cli.config.Config())
+
+    rc = cli.main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert 'MISSING -- pipx install "hunch-search[local]"' in out
 
 
 def test_reindex_embeddings_actually_rebuilds_vectors(tmp_path, monkeypatch):

@@ -78,3 +78,21 @@ def test_on_ac_power_true_when_no_battery_hardware_at_all(tmp_path, monkeypatch)
     # must never be treated as perpetually on battery.
     monkeypatch.setattr(probe, "_POWER_SUPPLY_DIR", tmp_path)
     assert probe.on_ac_power() is True
+
+
+def test_local_backend_importable_reports_a_genuinely_missing_package(monkeypatch):
+    # Regression test for a real bug: a `pipx install hunch-search` with no
+    # extras leaves sentence-transformers uninstalled, but nothing ever
+    # checked -- every file then silently fails at embed time. find_spec
+    # must correctly say "missing" for a package that truly isn't there.
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name: None if name == "sentence_transformers" else object())
+    assert probe.local_backend_importable() is False
+
+
+def test_media_importable_reports_a_genuinely_missing_package(monkeypatch):
+    monkeypatch.setattr(
+        "importlib.util.find_spec",
+        lambda name: None if name == "faster_whisper" else object())
+    assert probe.media_importable() is False

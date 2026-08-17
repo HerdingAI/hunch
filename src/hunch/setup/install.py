@@ -69,6 +69,12 @@ def install_user_units() -> list[Path]:
     block the cheap pass too. AC-power gating instead happens inside
     cmd_index itself (cli.py), via probe.on_ac_power(), so only enrichment
     is deferred on battery.
+
+    Raises RuntimeError if the timer could not actually be enabled -- the
+    unit files existing on disk is not the same as indexing ever running,
+    and this is the *only* thing that ever triggers enrichment (hunch
+    setup never indexes directly), so a silently-swallowed failure here
+    means a "successfully installed" system that never indexes anything.
     """
     unit_dir = Path(os.environ.get(
         "XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
@@ -77,9 +83,18 @@ def install_user_units() -> list[Path]:
     timer = unit_dir / "hunch-index.timer"
     service.write_text(SERVICE.format(exe=_exe()))
     timer.write_text(TIMER)
+    if shutil.which("systemctl") is None:
+        raise RuntimeError(
+            "systemctl not found -- cannot install the background indexing timer")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
-    subprocess.run(["systemctl", "--user", "enable", "--now", "hunch-index.timer"],
-                   check=False)
+    result = subprocess.run(
+        ["systemctl", "--user", "enable", "--now", "hunch-index.timer"],
+        capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            "systemctl --user enable --now hunch-index.timer failed: "
+            + (result.stderr.strip() or result.stdout.strip() or
+               f"exit code {result.returncode}"))
     return [service, timer]
 
 
