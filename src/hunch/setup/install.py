@@ -103,7 +103,14 @@ def install_launcher() -> Path:
     apps.mkdir(parents=True, exist_ok=True)
     dest = apps / "hunch.desktop"
     dest.write_text(DESKTOP.format(exe=_exe()))
-    subprocess.run(["update-desktop-database", str(apps)], check=False)
+    # Cache refresh only, not a functional dependency: the .desktop file
+    # itself is already written and will still be picked up (most desktop
+    # environments rescan periodically or on next login) even if this is
+    # missing or fails -- unlike the systemd timer, this is safe to skip
+    # quietly. Unlike check=False, a genuinely missing binary raises
+    # FileNotFoundError regardless -- shutil.which avoids that crash.
+    if shutil.which("update-desktop-database") is not None:
+        subprocess.run(["update-desktop-database", str(apps)], check=False)
     return dest
 
 
