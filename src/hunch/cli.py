@@ -45,11 +45,16 @@ def cmd_setup(args) -> int:
     print(verdict["summary"] + "\n")
 
     cfg = config.load_config()
-    if not caps.has_gpu or caps.vram_mb < probe.MIN_VRAM_MB:
-        # 4B embeddings are impractically slow without a GPU.
-        cfg.embed_model = "Qwen/Qwen3-Embedding-0.6B"
-    else:
+    # Gated on the 4B model's own memory need, not on MIN_VRAM_MB (which
+    # answers "is captioning practical", a different question). The 4B
+    # weights alone are ~7.5 GB: choosing it for any card over 4 GB meant
+    # an 8 GB card OOMed on every file forever, indexing nothing.
+    if caps.has_gpu and caps.vram_mb >= probe.EMBED_4B_MIN_VRAM_MB:
         cfg.embed_model = "Qwen/Qwen3-Embedding-4B"
+    else:
+        # Also the right choice with no GPU: 4B embeddings are
+        # impractically slow on CPU.
+        cfg.embed_model = "Qwen/Qwen3-Embedding-0.6B"
     config.save_config(cfg)
 
     # A `pipx install hunch-search` with no extras passes every hardware
@@ -206,7 +211,15 @@ def cmd_index(args) -> int:
     if not args.scheduled:
         seconds = cfg.first_run_budget_seconds
 
-    result = worker.run(conn, cfg, budget_seconds=seconds, limit=args.limit)
+    try:
+        result = worker.run(conn, cfg, budget_seconds=seconds, limit=args.limit)
+    except worker.SystemicFailure as exc:
+        # Not a crash: the run stopped itself because every file was failing
+        # identically. Say so in one readable sentence rather than a
+        # traceback, and leave a non-zero exit so the timer's journal entry
+        # is visibly a failure.
+        print(f"\nenrichment stopped: {exc}")
+        return 1
     print(f"enrichment: {result['processed']:,} files -> {result['counts']}")
 
     if args.scheduled:

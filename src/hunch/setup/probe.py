@@ -14,6 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MIN_VRAM_MB = 4096
+# Enough headroom for the 4B embedder, which is a very different question
+# from MIN_VRAM_MB above. That one asks "is vision captioning practical",
+# where 4 GB is a fair bar for Florence-2. Reusing it to pick the embedder
+# was measured wrong on a real 8 GB card: Qwen3-Embedding-4B is ~7.5 GB of
+# weights before any activations, so it filled the card, OOMed, and every
+# single file failed -- on hardware the README explicitly recommends. The
+# 4B model only makes sense with room for weights plus working memory.
+EMBED_4B_MIN_VRAM_MB = 16384
 # Module-level so tests can point it at a fake sysfs tree via monkeypatch
 # instead of depending on this machine's actual power state.
 _POWER_SUPPLY_DIR = Path("/sys/class/power_supply")

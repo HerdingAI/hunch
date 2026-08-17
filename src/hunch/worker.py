@@ -22,6 +22,29 @@ BATCH = 50
 # Whisper for `audio`, the vision model for `image_caption`. Released when
 # the phase ends so the two never stack (see drain()'s finally block).
 STAGE_MODEL_PHASES = {"audio", "image_caption"}
+# Consecutive *backend* failures that mean "stop the run" rather than "these
+# files are bad". Comfortably above any plausible transient blip, well below
+# the cost of failing a whole corpus one file at a time.
+SYSTEMIC_FAILURE_STREAK = 25
+
+
+class SystemicFailure(RuntimeError):
+    """The backend keeps failing; the run stops instead of grinding."""
+
+
+# Reasons written by the backend rather than by the extractor. A file with
+# no text is a fact about that file; a failed embed is a fact about the run.
+BACKEND_ERROR_PREFIXES = ("embed failed", "caption failed", "transcribe failed")
+
+
+def _is_backend_failure(conn, phase: str, item) -> bool:
+    if phase == "image_caption":
+        return True          # this phase's only failure mode is the backend
+    reason = conn.execute(
+        "SELECT error_reason FROM file_catalog WHERE id = ?",
+        (item[0],)).fetchone()
+    return bool(reason and reason[0]
+                and reason[0].startswith(BACKEND_ERROR_PREFIXES))
 
 
 def content_hash(path: str, size: int) -> tuple[str | None, str]:
@@ -266,6 +289,7 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
     overall = budget_mod.Budget(budget_seconds)
     counts: dict[str, int] = {}
     processed = 0
+    consecutive_backend_failures = 0
 
     def stats() -> dict:
         # Actual elapsed wall-clock, not the requested budget -- the caller
@@ -301,8 +325,29 @@ def run(conn, cfg: Config, budget_seconds: float, limit: int = 0, backend=None) 
                 conn.rollback()
                 status = _finish(conn, item[0], "failed",
                                  reason=f"unhandled: {exc}")
+        # Backend failures in a row mean the model/service itself is
+        # unusable -- not that these files are bad. Observed for real: an
+        # embedder larger than the GPU OOMed on every file while the run
+        # kept going, hours of thrashing to index nothing out of 147k
+        # files, driving every one of them toward its retry cap for a
+        # reason that had nothing to do with the file. Counting only
+        # backend errors is what separates that from a corpus whose first
+        # files happen to be junk: "no extractable text" is a fact about a
+        # file, "embed failed" is a fact about the run. Stopping leaves the
+        # rest pending for a run that might work.
+        nonlocal consecutive_backend_failures
+        if status == "failed" and _is_backend_failure(conn, phase, item):
+            consecutive_backend_failures += 1
+        elif status != "failed":
+            consecutive_backend_failures = 0
         counts[status] = counts.get(status, 0) + 1
         processed += 1
+        if consecutive_backend_failures >= SYSTEMIC_FAILURE_STREAK:
+            raise SystemicFailure(
+                f"stopped after {consecutive_backend_failures} consecutive "
+                f"backend failures -- the model or service looks unusable, "
+                f"rather than these files being bad. Run `hunch doctor`; the "
+                f"underlying error is recorded against the affected files.")
         return bool(limit and processed >= limit)
 
     def drain(phase, phase_budget) -> bool:

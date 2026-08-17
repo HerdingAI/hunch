@@ -250,3 +250,51 @@ def test_run_survives_an_unhandled_caption_backend_exception(tmp_path):
     source_kind = conn.execute(
         "SELECT source_kind FROM file_embedding WHERE content_hash=?", ("def456",)).fetchone()[0]
     assert source_kind == "image"
+
+
+def test_a_run_stops_instead_of_failing_an_entire_corpus_identically(tmp_path):
+    # Regression test for the failure that wasted a real first index: the
+    # configured embedder was larger than the GPU, so backend.embed() raised
+    # CUDA OOM on every file. The run kept going, marking each file failed
+    # in turn -- on a 147k-file corpus that is hours of thrashing to index
+    # exactly nothing, and it drives every file toward its retry cap for a
+    # reason that has nothing to do with the file.
+    class AlwaysOOM(StubBackend):
+        def embed(self, texts):
+            raise RuntimeError("CUDA out of memory. Tried to allocate 40.00 MiB")
+
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    for i in range(worker.SYSTEMIC_FAILURE_STREAK + 20):
+        f = tmp_path / f"doc{i}.txt"
+        f.write_text(f"document {i} with real words in it")
+        _row(conn, str(f), "txt", f.stat().st_size)
+
+    try:
+        worker.run(conn, Config(), budget_seconds=30.0, backend=AlwaysOOM())
+        assert False, "expected SystemicFailure"
+    except worker.SystemicFailure as exc:
+        assert "consecutive backend failures" in str(exc)
+
+    # Stopped early rather than working through every file...
+    attempted = conn.execute(
+        "SELECT count(*) FROM file_catalog WHERE status='failed'").fetchone()[0]
+    assert attempted <= worker.SYSTEMIC_FAILURE_STREAK
+    # ...leaving the rest pending for a run that might succeed.
+    assert conn.execute(
+        "SELECT count(*) FROM file_catalog WHERE status='pending'").fetchone()[0] > 0
+
+
+def test_genuinely_bad_files_do_not_stop_a_run_that_is_working(tmp_path):
+    # The guard must key on "nothing is succeeding", not on a failure count:
+    # a corpus with many broken files mixed among good ones has to keep going.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    for i in range(worker.SYSTEMIC_FAILURE_STREAK + 10):
+        f = tmp_path / f"empty{i}.txt"
+        f.write_text(" " * 30)              # extractable size, no real text
+        _row(conn, str(f), "txt", f.stat().st_size)
+    good = tmp_path / "good.txt"
+    good.write_text("a lease agreement for the flat")
+    _row(conn, str(good), "txt", good.stat().st_size)
+
+    stats = worker.run(conn, Config(), budget_seconds=30.0, backend=StubBackend())
+    assert stats["counts"].get("done") == 1        # the good one still landed
