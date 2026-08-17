@@ -149,4 +149,14 @@ def embedding_model_matches(conn: sqlite3.Connection, model: str, dim: int) -> b
     stored_dim = get_meta(conn, "embed_dim")
     if stored_model is None or stored_dim is None:
         return True     # fresh index; caller will stamp it
-    return stored_model == model and int(stored_dim) == dim
+    if stored_model == model and int(stored_dim) == dim:
+        return True
+    # The stamp is written at the start of a run, before any file is
+    # embedded, so a run that dies early claims a vector space it never
+    # wrote into. Seen for real: the first index picked an embedder too
+    # large for the GPU and failed every file, then fixing the model left
+    # the index permanently wedged -- refusing to run and demanding
+    # `hunch reindex --embeddings` to rebuild zero vectors from zero stored
+    # text. With nothing embedded there is no vector space to protect and
+    # nothing to mix, so any model is free to claim it.
+    return conn.execute("SELECT NOT EXISTS(SELECT 1 FROM file_embedding)").fetchone()[0] == 1

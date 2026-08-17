@@ -37,6 +37,11 @@ def test_embedding_model_mismatch_is_detected(tmp_path):
     conn = db.connect(tmp_path / "index.db")
     db.set_meta(conn, "embed_model", "modelA")
     db.set_meta(conn, "embed_dim", "1024")
+    # A vector must exist for there to be a vector space worth protecting --
+    # see test_an_index_with_no_embeddings_is_not_claimed_by_a_model below.
+    conn.execute("INSERT INTO file_embedding(content_hash, extracted_text, "
+                 "source_kind, model) VALUES ('h','t','document','modelA')")
+    conn.commit()
     assert db.embedding_model_matches(conn, "modelA", 1024)
     assert not db.embedding_model_matches(conn, "modelB", 1024)
     assert not db.embedding_model_matches(conn, "modelA", 768)
@@ -86,3 +91,31 @@ def test_schema_is_still_created_on_a_fresh_database(tmp_path):
     assert {"file_catalog", "file_embedding", "meta"} <= names
     assert db.get_meta(conn, "schema_version") == str(db.SCHEMA_VERSION)
     assert db.vec_dim(conn) == 4
+
+
+def test_an_index_with_no_embeddings_is_not_claimed_by_a_model(tmp_path):
+    # Regression test for a real wedge: worker.run stamps embed_model at the
+    # *start* of a run, before embedding anything, so a run that dies early
+    # claims a vector space it never wrote into. Hit for real -- the first
+    # index chose an embedder too big for the GPU, failed every file, and
+    # stamped the index anyway; fixing the model then made every future run
+    # abort with "run `hunch reindex --embeddings`", a recovery command with
+    # zero vectors and zero stored text to rebuild from.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    db.set_meta(conn, "embed_model", "some/old-model")
+    db.set_meta(conn, "embed_dim", "4")
+    assert conn.execute("SELECT count(*) FROM file_embedding").fetchone()[0] == 0
+    assert db.embedding_model_matches(conn, "a/different-model", 4) is True
+
+
+def test_a_populated_index_still_refuses_a_different_model(tmp_path):
+    # The guard must keep doing its actual job: once vectors exist, mixing
+    # models silently produces meaningless search results.
+    conn = db.connect(tmp_path / "i.db", dim=4)
+    db.set_meta(conn, "embed_model", "some/old-model")
+    db.set_meta(conn, "embed_dim", "4")
+    conn.execute("INSERT INTO file_embedding(content_hash, extracted_text, "
+                 "source_kind, model) VALUES ('h','t','document','some/old-model')")
+    conn.commit()
+    assert db.embedding_model_matches(conn, "a/different-model", 4) is False
+    assert db.embedding_model_matches(conn, "some/old-model", 4) is True
