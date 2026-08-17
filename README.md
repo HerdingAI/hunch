@@ -64,10 +64,17 @@ much faster with an NVIDIA GPU of 4 GB or more; without one you can either
 skip them or enable them with `hunch auth openrouter`, which explains what
 gets uploaded before it stores anything.
 
-Hunch is budgeted: the first index takes at most about five hours, and it
-spends at most twenty cumulative minutes a day after that, tracked across the
-hourly background timer rather than reset on every run, running only on
-mains power and at idle priority.
+Hunch is budgeted so it never takes the machine over: it spends at most about
+five hours on the first pass, then at most twenty cumulative minutes a day,
+tracked across the hourly background timer rather than reset on every run,
+running only on mains power and at idle priority.
+
+Those are spending limits, not completion times. Most home folders finish
+well inside the first pass; a very large one may not, and then the remainder
+is worked through at twenty minutes a day. Hunch tells you if that happens,
+and `hunch status` shows which folders the backlog is in — the usual cause is
+a folder full of machine-generated files that is better excluded than
+indexed.
 
 ## Privacy
 

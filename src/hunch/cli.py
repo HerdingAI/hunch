@@ -224,11 +224,34 @@ def cmd_index(args) -> int:
 
     if args.scheduled:
         if not first_pass_done:
-            db.set_meta(conn, "first_pass_spent_seconds",
-                        str(float(db.get_meta(conn, "first_pass_spent_seconds") or 0)
-                            + result["seconds"]))
+            spent = (float(db.get_meta(conn, "first_pass_spent_seconds") or 0)
+                     + result["seconds"])
+            db.set_meta(conn, "first_pass_spent_seconds", str(spent))
             if budget_mod.next_phase(conn) is None:
                 db.set_meta(conn, "first_pass_done", "1")
+            elif spent >= cfg.first_run_budget_seconds:
+                # The first pass is over and the corpus did not fit in it.
+                # From here indexing drops to daily_budget_seconds, which on
+                # a large corpus is the difference between "finishes tonight"
+                # and "finishes next month" -- measured at 134 files/min on a
+                # real 149k-file index, the remaining ~77k files would take
+                # about 29 days. Saying nothing leaves the user believing the
+                # index is complete when most of it is not.
+                left = conn.execute(
+                    "SELECT count(*) FROM file_catalog "
+                    "WHERE status='pending' AND deleted_at IS NULL").fetchone()[0]
+                db.set_meta(conn, "first_pass_done", "1")
+                print(
+                    f"\nFirst-pass budget "
+                    f"({cfg.first_run_budget_seconds // 3600}h) is spent and "
+                    f"{left:,} files are still unindexed.\n"
+                    f"Indexing continues in the background at "
+                    f"{cfg.daily_budget_seconds // 60} minutes a day, so the "
+                    f"rest will take a while.\n"
+                    f"`hunch status` shows which folders these files are in; "
+                    f"narrowing `folders` in\n{config.config_path()} is the "
+                    f"fastest way to finish, or run `hunch index` to keep "
+                    f"going now.")
         else:
             db.set_meta(conn, "budget_day", today)
             db.set_meta(conn, "budget_spent_today", str(spent_today + result["seconds"]))

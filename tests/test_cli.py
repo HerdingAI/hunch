@@ -626,3 +626,38 @@ def test_status_shows_which_folder_dominates_the_index(tmp_path, monkeypatch, ca
     assert "90.0%" in out
     assert "most of your index" in out            # and says what to do
     assert str(cli.config.config_path()) in out
+
+
+def test_index_says_so_when_the_first_pass_ends_with_work_left(tmp_path, monkeypatch, capsys):
+    # Measured on a real 149,058-file index: 134 files/min against a 5-hour
+    # first-pass budget leaves ~77,000 files unindexed, which then take about
+    # 29 days at 20 minutes a day. The handoff was silent, so the user would
+    # reasonably believe indexing had finished when most of it had not.
+    from hunch import config as config_mod, db as db_mod
+
+    cfg = config_mod.Config()
+    cfg.folders = [tmp_path]
+    cfg.first_run_budget_seconds = 100
+    conn = db_mod.connect(tmp_path / "i.db", dim=cfg.embed_dim)
+    conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                 "VALUES (?,?,?,?,'pending')", (str(tmp_path / "a.txt"), "a.txt", "txt", 99))
+    conn.commit()
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+    monkeypatch.setattr(cli.catalog, "crawl",
+                        lambda c, cf: {"seen": 0, "added": 0, "updated": 0,
+                                       "tombstoned": 0, "seconds": 0.0,
+                                       "skipped_roots": []})
+    monkeypatch.setattr(cli.probe, "on_ac_power", lambda: True)
+    # Spends the whole first-pass budget without clearing the backlog.
+    monkeypatch.setattr(cli.worker, "run",
+                        lambda *a, **k: {"processed": 5, "counts": {"done": 5},
+                                         "seconds": 100.0})
+    monkeypatch.setattr(cli.budget_mod, "next_phase", lambda conn: "document")
+
+    assert cli.main(["index", "--scheduled"]) == 0
+    out = capsys.readouterr().out
+    assert "still unindexed" in out
+    assert "minutes a day" in out
+    assert str(cli.config.config_path()) in out
+    # And the state machine really did hand off, so it says this once.
+    assert db_mod.get_meta(conn, "first_pass_done") == "1"
