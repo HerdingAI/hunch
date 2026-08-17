@@ -125,7 +125,25 @@ def cmd_index(args) -> int:
         return 0
 
     today = spent_today = None
-    if args.scheduled:
+    # hunch setup never indexes directly -- it only installs the hourly
+    # timer, which always runs with --scheduled -- so the 5-hour first-run
+    # budget is unreachable unless a scheduled run can use it too. Tracked
+    # as its own cumulative pool (first_pass_spent_seconds), separate from
+    # the daily pool, so an hourly timer doesn't grant a fresh 5 hours on
+    # every firing: the *whole* first pass is capped at first_run_budget_
+    # seconds total, matching "first full index <=5 hours" as a ceiling on
+    # the pass, not a per-invocation allowance.
+    first_pass_done = args.scheduled and db.get_meta(conn, "first_pass_done") == "1"
+    if args.scheduled and not first_pass_done:
+        first_pass_spent = float(db.get_meta(conn, "first_pass_spent_seconds") or 0)
+        seconds = max(0.0, cfg.first_run_budget_seconds - first_pass_spent)
+        if seconds <= 0:
+            # The 5-hour ceiling is spent without clearing the backlog --
+            # fall through to steady-state daily budgeting rather than
+            # spending nothing every hour until someone notices.
+            first_pass_done = True
+            db.set_meta(conn, "first_pass_done", "1")
+    if args.scheduled and first_pass_done:
         # Cumulative same-day spend, not per-invocation: the hourly timer
         # calls this every hour, and each firing budgeting the full daily
         # allowance independently would let actual spend run up to ~24x the
@@ -138,15 +156,22 @@ def cmd_index(args) -> int:
             print("daily budget already spent today; nothing more until tomorrow")
             _prune(conn)
             return 0
-    else:
+    if not args.scheduled:
         seconds = cfg.first_run_budget_seconds
 
     result = worker.run(conn, cfg, budget_seconds=seconds, limit=args.limit)
     print(f"enrichment: {result['processed']:,} files -> {result['counts']}")
 
     if args.scheduled:
-        db.set_meta(conn, "budget_day", today)
-        db.set_meta(conn, "budget_spent_today", str(spent_today + result["seconds"]))
+        if not first_pass_done:
+            db.set_meta(conn, "first_pass_spent_seconds",
+                        str(float(db.get_meta(conn, "first_pass_spent_seconds") or 0)
+                            + result["seconds"]))
+            if budget_mod.next_phase(conn) is None:
+                db.set_meta(conn, "first_pass_done", "1")
+        else:
+            db.set_meta(conn, "budget_day", today)
+            db.set_meta(conn, "budget_spent_today", str(spent_today + result["seconds"]))
         _prune(conn)
     return 0
 

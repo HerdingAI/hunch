@@ -62,6 +62,9 @@ def test_scheduled_index_tracks_cumulative_daily_spend(tmp_path, monkeypatch):
     cfg.folders = [tmp_path]
     cfg.daily_budget_seconds = 100
     conn = db_mod.connect(tmp_path / "i.db", dim=cfg.embed_dim)
+    # Past the first-index pass already -- this test verifies steady-state
+    # daily tracking, not first-pass budgeting (covered separately).
+    db_mod.set_meta(conn, "first_pass_done", "1")
     monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
     monkeypatch.setattr(
         cli.catalog, "crawl",
@@ -106,6 +109,52 @@ def test_scheduled_index_defers_enrichment_on_battery(tmp_path, monkeypatch, cap
     assert rc == 0
     assert called == []                # the expensive pass never ran
     assert "battery" in capsys.readouterr().out.lower()
+
+
+def test_scheduled_index_spends_first_run_budget_until_backlog_clears(tmp_path, monkeypatch):
+    # Regression test for a real bug: hunch setup never indexes directly --
+    # only the hourly timer does, and it always passes --scheduled -- so
+    # without first-pass tracking, the 5-hour first_run_budget_seconds was
+    # unreachable and every firing (including the very first) used the
+    # 20-min daily budget instead, turning a "few hours" first index into
+    # potentially weeks on a large corpus.
+    from hunch import config as config_mod, db as db_mod
+
+    cfg = config_mod.Config()
+    cfg.folders = [tmp_path]
+    cfg.first_run_budget_seconds = 100
+    cfg.daily_budget_seconds = 20
+    conn = db_mod.connect(tmp_path / "i.db", dim=cfg.embed_dim)
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+    monkeypatch.setattr(
+        cli.catalog, "crawl",
+        lambda c, cf: {"seen": 0, "added": 0, "updated": 0, "tombstoned": 0,
+                       "seconds": 0.0, "skipped_roots": []})
+    monkeypatch.setattr(cli.probe, "on_ac_power", lambda: True)
+
+    seen_budgets = []
+
+    def fake_run(conn, cfg, budget_seconds, limit=0):
+        seen_budgets.append(budget_seconds)
+        return {"processed": 0, "counts": {}, "seconds": 40.0}
+
+    monkeypatch.setattr(cli.worker, "run", fake_run)
+    # Backlog still pending for the first two firings, clears on the third.
+    phase_calls = []
+
+    def fake_next_phase(conn):
+        phase_calls.append(True)
+        return None if len(phase_calls) >= 3 else "document"
+
+    monkeypatch.setattr(cli.budget_mod, "next_phase", fake_next_phase)
+
+    cli.main(["index", "--scheduled"])
+    cli.main(["index", "--scheduled"])
+    cli.main(["index", "--scheduled"])   # backlog clears here
+    cli.main(["index", "--scheduled"])   # steady-state daily budget now
+
+    assert seen_budgets == [100, 60, 20, 20]
+    assert db_mod.get_meta(conn, "first_pass_done") == "1"
 
 
 def test_reindex_embeddings_actually_rebuilds_vectors(tmp_path, monkeypatch):
