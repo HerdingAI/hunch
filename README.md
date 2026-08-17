@@ -39,7 +39,8 @@ is required: there is no daemon to configure and no cron to write.
 Indexing runs in the background rather than making you wait, so results fill
 in over the first few hours rather than appearing all at once. `hunch status`
 shows how far along it is. To index right now instead of waiting for the
-timer, run `hunch index`.
+timer, run `hunch index` — running it again while it (or the timer) is
+already going is safe; the second one just steps aside.
 
 Press **Super+F** to search, or:
 
@@ -63,6 +64,10 @@ would be decoded at full cost and then discarded — on a 1,200-hour library tha
 is the difference between hours and days. A topic first raised late in a long
 recording won't be findable by it; set `transcribe_max_seconds = 0` in the
 config to transcribe recordings in full.
+
+Plain text files are read up to 8 MB; past that the rest is simply not
+indexed, since search only ever embeds the first few thousand characters
+anyway. Documents (PDF, Word, and the rest) go up to 200 MB.
 
 ## Hardware
 
