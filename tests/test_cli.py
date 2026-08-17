@@ -661,3 +661,46 @@ def test_index_says_so_when_the_first_pass_ends_with_work_left(tmp_path, monkeyp
     assert str(cli.config.config_path()) in out
     # And the state machine really did hand off, so it says this once.
     assert db_mod.get_meta(conn, "first_pass_done") == "1"
+
+
+def test_prune_bounds_the_timing_table(tmp_path):
+    # enrich_timing gained ~2.4 rows per enriched file and nothing removed
+    # any: 106,322 rows part-way through one real 149k-file index, growing
+    # forever across every future re-enrichment.
+    from hunch import db as db_mod
+
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    for i in range(cli.TIMING_RETAINED_ROWS + 500):
+        conn.execute("INSERT INTO enrich_timing(source_kind, stage, seconds) "
+                     "VALUES ('document','hash',0.1)")
+    conn.commit()
+    cli._prune(conn)
+    kept = conn.execute("SELECT count(*) FROM enrich_timing").fetchone()[0]
+    assert kept <= cli.TIMING_RETAINED_ROWS + 1
+    # And still enough for the estimate that reads it.
+    from hunch import budget as budget_mod
+    assert kept > budget_mod.RATE_SAMPLE
+
+
+def test_status_estimates_how_long_the_current_phase_will_take(tmp_path, monkeypatch, capsys):
+    # The counts alone never answered "how long will this take", which on a
+    # large corpus is the difference between waiting up and going to bed.
+    from hunch import config as config_mod, db as db_mod
+
+    cfg = config_mod.Config()
+    cfg.folders = [tmp_path]
+    conn = db_mod.connect(tmp_path / "i.db", dim=4)
+    for i in range(50):
+        conn.execute("INSERT INTO file_catalog(path, filename, ext, size_bytes, status) "
+                     "VALUES (?,?,?,?,'pending')",
+                     (f"{tmp_path}/f{i}.txt", f"f{i}.txt", "txt", 100))
+    for _ in range(10):
+        conn.execute("INSERT INTO enrich_timing(source_kind, stage, seconds) "
+                     "VALUES ('document','hash',1.0)")
+    conn.commit()
+    monkeypatch.setattr(cli, "_open", lambda: (conn, cfg))
+
+    assert cli.main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "to go" in out
+    assert "measured" in out

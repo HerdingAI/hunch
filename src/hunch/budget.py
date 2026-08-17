@@ -92,3 +92,40 @@ def next_phase(conn) -> str | None:
         if phase_has_pending(conn, phase):
             return phase
     return None
+
+
+# Timings older than this stop describing the machine you have now -- a
+# different corpus, a freed GPU, a model change. Recent work is the honest
+# predictor.
+RATE_SAMPLE = 2000
+
+
+def seconds_per_file(conn, phase: str) -> float | None:
+    """Measured enrichment cost per file for `phase`, or None if unknown.
+
+    The spec's argument for the budget contract holding "on hardware we have
+    never seen" rests on the worker planning from its own measured rates, and
+    enrich_timing was specified as the table feeding that. Nothing read it:
+    every run wrote 2.4 rows per file that were never consumed by anything.
+    This is that read side, kept deliberately small -- an honest estimate the
+    user can see, not a scheduler that silently reallocates their budget.
+
+    `hash` is recorded exactly once per enriched file, so counting it gives
+    the file count that the summed stage seconds belong to.
+    """
+    kinds = {"document": ("document",),
+             "image_meta": ("image",),
+             "audio": ("audio", "video"),
+             "image_caption": ("image",)}.get(phase)
+    if not kinds:
+        return None
+    marks = ",".join("?" * len(kinds))
+    row = conn.execute(
+        f"SELECT sum(seconds), sum(stage = 'hash') FROM "
+        f"(SELECT seconds, stage FROM enrich_timing "
+        f" WHERE source_kind IN ({marks}) ORDER BY id DESC LIMIT ?)",
+        (*kinds, RATE_SAMPLE)).fetchone()
+    total, files = row[0] or 0.0, row[1] or 0
+    if not files or total <= 0:
+        return None
+    return total / files

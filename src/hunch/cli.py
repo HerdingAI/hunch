@@ -15,6 +15,9 @@ from .backends import get_backend
 from .setup import install, probe
 
 PRUNE_TOMBSTONE_DAYS = 90
+# Comfortably more than budget.RATE_SAMPLE (what the estimate actually
+# reads), so trimming never starves the measurement it exists to serve.
+TIMING_RETAINED_ROWS = 20000
 
 
 def _open():
@@ -150,6 +153,14 @@ def _prune(conn) -> dict:
         "DELETE FROM file_embedding WHERE content_hash NOT IN ("
         "  SELECT content_hash FROM file_catalog "
         "  WHERE content_hash IS NOT NULL)").rowcount
+    # enrich_timing gains ~2.4 rows per enriched file and nothing ever
+    # removed any: 106,322 rows part-way through one real index, and every
+    # future re-enrichment adds more, forever. Only recent rows describe the
+    # machine as it is now, and that is all seconds_per_file() reads, so keep
+    # a window rather than a history.
+    conn.execute(
+        "DELETE FROM enrich_timing WHERE id < "
+        "(SELECT max(id) - ? FROM enrich_timing)", (TIMING_RETAINED_ROWS,))
     conn.commit()
     if orphaned or purged:
         conn.execute("ANALYZE")
@@ -351,7 +362,36 @@ def cmd_status(args) -> int:
     phase = budget_mod.next_phase(conn)
     print("\nCurrent phase: " +
           (budget_mod.PHASE_LABELS[phase] if phase else "up to date"))
+
+    # "How long will this take" is the question the counts above never
+    # answer, and on a large corpus the honest answer is the difference
+    # between waiting up and going to bed. The worker has been measuring
+    # this all along -- enrich_timing exists precisely to feed planning --
+    # so the numbers are real rather than a guess from file counts.
+    if phase:
+        per_file = budget_mod.seconds_per_file(conn, phase)
+        left = budget_mod.pending_count(conn, phase)
+        if per_file and left:
+            work = left * per_file
+            print(f"  {left:,} to go, about {_duration(work)} of processing "
+                  f"at the measured {per_file:.2f}s each")
+            if db.get_meta(conn, "first_pass_done") == "1":
+                # Past the first pass this is not elapsed time: only
+                # daily_budget_seconds of it happens per day.
+                days = work / max(cfg.daily_budget_seconds, 1)
+                if days >= 2:
+                    print(f"  at {cfg.daily_budget_seconds // 60} minutes a "
+                          f"day that is about {days:.0f} days -- `hunch index` "
+                          f"runs it now instead")
     return 0
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 def cmd_doctor(args) -> int:
