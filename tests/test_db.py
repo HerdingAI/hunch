@@ -1,4 +1,66 @@
+import os
+import threading
+
 import hunch.db as db
+
+
+def _own_fds_on(path):
+    n = 0
+    for fd in os.listdir(f"/proc/{os.getpid()}/fd"):
+        try:
+            target = os.readlink(f"/proc/{os.getpid()}/fd/{fd}")
+        except OSError:
+            continue
+        if target == str(path):
+            n += 1
+    return n
+
+
+def test_check_same_thread_false_allows_cross_thread_use(tmp_path):
+    conn = db.connect(tmp_path / "index.db", check_same_thread=False)
+    error = []
+
+    def worker():
+        try:
+            conn.execute("SELECT 1").fetchone()
+        except Exception as exc:                      # noqa: BLE001
+            error.append(exc)
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    assert error == []
+
+
+def test_reusing_one_shared_connection_does_not_leak_fds(tmp_path):
+    # The GUI keeps one long-lived connection open for the app's whole life
+    # (self._conn) plus, since the fix in this commit, one dedicated,
+    # reused search connection -- not a fresh connect()+close() per search.
+    # SQLite's unix VFS parks (never actually releases) a connection's file
+    # descriptor as long as *any other* connection to that same inode is
+    # still open in-process, to protect POSIX advisory locks -- so with a
+    # long-lived connection already open, the old "fresh connection per
+    # search" pattern leaked one fd per search for the process's entire
+    # lifetime. Reusing a single shared connection across every search
+    # opens exactly one extra fd, once, regardless of how many searches run.
+    path = tmp_path / "index.db"
+    long_lived = db.connect(path)          # mimics self._conn
+    baseline = _own_fds_on(path)
+
+    shared = db.connect(path, check_same_thread=False)   # mimics self._search_conn
+    lock = threading.Lock()
+
+    def search():
+        with lock:
+            shared.execute("SELECT 1").fetchone()
+
+    threads = [threading.Thread(target=search) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # +1 for `shared` itself; no growth from the 10 "searches" that reused it.
+    assert _own_fds_on(path) == baseline + 1
 
 
 def test_connect_creates_tables(tmp_path):

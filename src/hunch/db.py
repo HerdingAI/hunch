@@ -33,7 +33,8 @@ def serialize(vector) -> bytes:
     return struct.pack(f"{len(vector)}f", *vector)
 
 
-def connect(path: Path | None = None, dim: int | None = None) -> sqlite3.Connection:
+def connect(path: Path | None = None, dim: int | None = None,
+            check_same_thread: bool = True) -> sqlite3.Connection:
     path = Path(path) if path else config.db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
@@ -41,7 +42,7 @@ def connect(path: Path | None = None, dim: int | None = None) -> sqlite3.Connect
     # place, so it must not inherit a permissive umask (0o644 would let any
     # other local account on the machine read it).
     is_new = not path.exists()
-    conn = sqlite3.connect(path, timeout=30.0)
+    conn = sqlite3.connect(path, timeout=30.0, check_same_thread=check_same_thread)
     if is_new:
         os.chmod(path, 0o600)
     conn.enable_load_extension(True)

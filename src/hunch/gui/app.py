@@ -46,11 +46,29 @@ def run_gui(initial_query: str = "") -> int:
             self._cfg = config.load_config()
             # Main-thread-only: _render (dispatched via GLib.idle_add, so
             # it always runs on the main loop) is the only place this
-            # connection is touched. _work runs in a spawned thread and
-            # opens its own connection instead -- sqlite3.Connection
-            # objects default to check_same_thread=True, so sharing this
-            # one across threads would raise on every search.
+            # connection is touched.
             self._conn = db.connect(config.db_path(), dim=self._cfg.embed_dim)
+            # _work runs in a spawned thread, so it needs its own connection
+            # (opened with check_same_thread=False) rather than sharing
+            # self._conn. A *dedicated, reused* one, not a fresh open+close
+            # per search: SQLite's unix VFS keeps a per-process registry of
+            # every open file descriptor on a given inode so it can protect
+            # POSIX advisory locks (closing any one fd on a file silently
+            # drops every lock the whole process holds on it, POSIX-wide --
+            # not just that fd's). As long as self._conn above stays open
+            # for the app's lifetime, that protection means closing a
+            # throwaway per-search connection never actually released its
+            # own file descriptor either -- confirmed live: 8 open-then-
+            # closed search connections left 8 permanently open fds on
+            # index.db, all reclaimed at once only when the last connection
+            # to the file (self._conn) finally closed. A long GUI session
+            # doing many searches would slowly exhaust the process's file
+            # descriptor limit. One connection, opened once and reused
+            # under a lock, opens exactly one extra fd for the app's whole
+            # life instead of one per search.
+            self._search_conn = db.connect(config.db_path(), dim=self._cfg.embed_dim,
+                                           check_same_thread=False)
+            self._search_lock = threading.Lock()
             self._backend = None
             self._backend_lock = threading.Lock()
             # Closing the window (Escape) hides it instead of destroying
@@ -149,16 +167,14 @@ def run_gui(initial_query: str = "") -> int:
         def _work(self, text: str, seq: int):
             try:
                 backend = self._get_backend()
-                # A fresh connection per search: WAL mode (db.connect's own
-                # setup) makes this cheap (~0.3ms) and safe to do
-                # concurrently with the main thread's connection and with a
-                # separate background indexer process.
-                conn = db.connect(config.db_path(), dim=self._cfg.embed_dim)
-                try:
-                    results = search_mod.search(conn, self._cfg, text,
-                                                backend=backend)
-                finally:
-                    conn.close()
+                # self._search_conn is shared by every search thread, so
+                # only one search actually touches SQLite at a time -- WAL
+                # mode still lets it run concurrently with the main
+                # thread's self._conn and with a separate background
+                # indexer process, just not with another _work() thread.
+                with self._search_lock:
+                    results = search_mod.search(self._search_conn, self._cfg,
+                                                text, backend=backend)
                 err = ""
             except Exception as exc:               # noqa: BLE001
                 results, err = [], str(exc)
