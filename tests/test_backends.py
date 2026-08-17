@@ -63,7 +63,7 @@ def test_local_backend_transcribe_times_out_without_hanging_forever(monkeypatch)
     class HangingModel:
         def transcribe(self, path, beam_size=1, **kw):
             _time.sleep(5)
-            return [], None
+            return [], type("Info", (), {"duration": 1.0})()
 
     b = mod.LocalBackend(Config())
     b._whisper = HangingModel()
@@ -71,6 +71,31 @@ def test_local_backend_transcribe_times_out_without_hanging_forever(monkeypatch)
     text, err = b.transcribe("irrelevant.wav")
     assert text == ""
     assert "timeout" in err
+
+
+def test_zero_duration_decode_is_a_failure_not_silence(monkeypatch):
+    # faster-whisper doesn't raise on a corrupted/truncated media file -- it
+    # silently decodes nothing and returns an empty segment list, which
+    # reads identically to "successfully decoded and there's no speech in
+    # it" unless something checks the decoded duration. Confirmed live
+    # against two real corrupted audiobook files (headers of all 0xFF and
+    # all 0x00 bytes): both decoded to duration=0.0 in well under a second
+    # and were misfiled as "no speech detected" rather than "failed",
+    # hiding a real, actionable problem. A genuinely short or silent clip
+    # still reports its own small but nonzero duration (confirmed against
+    # real short/silent files already in the index: 0.1-1.3s), so duration
+    # == 0 is a safe signal that decoding produced nothing at all.
+    import hunch.backends.local_inprocess as mod
+
+    class ZeroDurationModel:
+        def transcribe(self, path, beam_size=1, **kw):
+            return [], type("Info", (), {"duration": 0.0})()
+
+    b = mod.LocalBackend(Config())
+    b._whisper = ZeroDurationModel()
+    text, err = b.transcribe("corrupted.mp3")
+    assert text == ""
+    assert "corrupted" in err or "decode" in err
 
 
 def test_local_backend_transcribe_falls_back_to_cpu_on_cuda_failure(monkeypatch):
@@ -89,7 +114,8 @@ def test_local_backend_transcribe_falls_back_to_cpu_on_cuda_failure(monkeypatch)
             if self.device == "cuda":
                 raise RuntimeError(
                     "Library libcublas.so.12 is not found or cannot be loaded")
-            return [type("Seg", (), {"text": "fallback ok"})()], None
+            info = type("Info", (), {"duration": 1.0})()
+            return [type("Seg", (), {"text": "fallback ok"})()], info
 
     monkeypatch.setattr(
         "faster_whisper.WhisperModel",
@@ -216,7 +242,7 @@ def test_transcription_is_capped_to_what_can_reach_a_vector():
     class RecordingModel:
         def transcribe(self, path, beam_size=1, **kw):
             seen.update(kw)
-            return [], None
+            return [], type("Info", (), {"duration": 1.0})()
 
     cfg = Config()
     cfg.transcribe_max_seconds = 300
@@ -236,7 +262,7 @@ def test_transcription_cap_of_zero_means_the_whole_recording():
     class RecordingModel:
         def transcribe(self, path, beam_size=1, **kw):
             seen.update(kw)
-            return [], None
+            return [], type("Info", (), {"duration": 1.0})()
 
     cfg = Config()
     cfg.transcribe_max_seconds = 0
@@ -261,7 +287,7 @@ def test_the_cap_cuts_the_audio_rather_than_only_bounding_inference(monkeypatch,
         def transcribe(self, path, beam_size=1, **kw):
             seen["path"] = path
             seen["kwargs"] = kw
-            return [], None
+            return [], type("Info", (), {"duration": 1.0})()
 
     def fake_run(cmd, **kw):
         seen["cmd"] = cmd
@@ -295,7 +321,7 @@ def test_the_cap_still_applies_without_ffmpeg(monkeypatch):
     class RecordingModel:
         def transcribe(self, path, beam_size=1, **kw):
             seen.update(path=path, **kw)
-            return [], None
+            return [], type("Info", (), {"duration": 1.0})()
 
     monkeypatch.setattr(mod.shutil, "which", lambda n: None)
     cfg = Config()

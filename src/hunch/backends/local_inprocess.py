@@ -152,6 +152,24 @@ class LocalBackend(Backend):
         return self._whisper
 
     def _transcribe_once(self, model, path: str) -> tuple[str, str]:
+        def _collect(segments, info):
+            # duration == 0 means faster-whisper decoded no audio at all --
+            # not "decoded successfully and there's silence in it" (a real
+            # silent clip still reports its own, nonzero, small duration;
+            # confirmed against real short/silent files in this index, all
+            # 0.1-1.3s). A corrupted or truncated media file hits this same
+            # zero exactly, and reads identically to "no speech detected" if
+            # left alone -- confirmed live against two real corrupted
+            # audiobook files (headers of all 0xFF and all 0x00 bytes) that
+            # both landed on 'skipped: no speech detected' instead of
+            # 'failed', hiding a real, actionable problem (a broken file the
+            # user would want to know about and could re-download or
+            # restore) behind a message that means "nothing wrong here."
+            if info.duration == 0:
+                raise RuntimeError(
+                    "could not decode any audio (file may be corrupted)")
+            return " ".join(s.text for s in segments).strip()
+
         def _run():
             # Transcribe an opening slice rather than the whole recording.
             # The embedder reads the first EMBED_CHARS characters and speech
@@ -167,8 +185,8 @@ class LocalBackend(Backend):
             # file if that matters more than the time.
             cap = getattr(self.cfg, "transcribe_max_seconds", 0) or 0
             if cap <= 0:
-                segments, _info = model.transcribe(path, beam_size=1)
-                return " ".join(s.text for s in segments).strip()
+                segments, info = model.transcribe(path, beam_size=1)
+                return _collect(segments, info)
 
             # Cut the slice with ffmpeg rather than passing clip_timestamps.
             # clip_timestamps bounds *inference*, but faster-whisper still
@@ -187,13 +205,13 @@ class LocalBackend(Backend):
                          "-i", path, "-ac", "1", "-ar", "16000", clip, "-y"],
                         capture_output=True, check=False)
                     if proc.returncode == 0 and os.path.exists(clip):
-                        segments, _info = model.transcribe(clip, beam_size=1)
-                        return " ".join(s.text for s in segments).strip()
+                        segments, info = model.transcribe(clip, beam_size=1)
+                        return _collect(segments, info)
             # No ffmpeg (or it could not read this container): still honour
             # the cap, just without the decode saving.
-            segments, _info = model.transcribe(
+            segments, info = model.transcribe(
                 path, beam_size=1, clip_timestamps=[0.0, float(cap)])
-            return " ".join(s.text for s in segments).strip()
+            return _collect(segments, info)
 
         # A thread with a deadline can't kill a stuck native call outright,
         # but it unblocks the worker loop so one malformed file doesn't stall
