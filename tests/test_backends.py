@@ -244,3 +244,64 @@ def test_transcription_cap_of_zero_means_the_whole_recording():
     b._whisper = RecordingModel()
     b.transcribe("/tmp/whatever.mp3")
     assert "clip_timestamps" not in seen
+
+
+def test_the_cap_cuts_the_audio_rather_than_only_bounding_inference(monkeypatch, tmp_path):
+    # clip_timestamps bounds inference but faster-whisper still decodes the
+    # whole file to build its feature array, so decode cost stayed
+    # proportional to full length. Measured on a 58 MB audiobook chapter:
+    # 26.9s via clip_timestamps against 6.8s cutting with ffmpeg first, for
+    # a transcript the same length to within two characters. The pending
+    # queue on the machine this was found on runs to 3.9 GB per file.
+    import hunch.backends.local_inprocess as mod
+
+    seen = {"cmd": None, "path": None, "kwargs": None}
+
+    class RecordingModel:
+        def transcribe(self, path, beam_size=1, **kw):
+            seen["path"] = path
+            seen["kwargs"] = kw
+            return [], None
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        open(cmd[cmd.index("-y") - 1], "wb").write(b"RIFF fake wav")
+        return type("P", (), {"returncode": 0})()
+
+    monkeypatch.setattr(mod.shutil, "which", lambda n: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    cfg = Config()
+    cfg.transcribe_max_seconds = 300
+    b = mod.LocalBackend(cfg)
+    b._whisper = RecordingModel()
+    b.transcribe("/tmp/long-recording.mp3")
+
+    # ffmpeg was told to stop decoding at the cap...
+    assert "-t" in seen["cmd"] and seen["cmd"][seen["cmd"].index("-t") + 1] == "300"
+    # ...and whisper got the short clip, not the original file.
+    assert seen["path"].endswith("clip.wav")
+    # No need to also bound inference: the input is already only that long.
+    assert "clip_timestamps" not in seen["kwargs"]
+
+
+def test_the_cap_still_applies_without_ffmpeg(monkeypatch):
+    # Degraded, not broken: honour the cap through clip_timestamps when
+    # there is no ffmpeg to cut with, just without the decode saving.
+    import hunch.backends.local_inprocess as mod
+
+    seen = {}
+
+    class RecordingModel:
+        def transcribe(self, path, beam_size=1, **kw):
+            seen.update(path=path, **kw)
+            return [], None
+
+    monkeypatch.setattr(mod.shutil, "which", lambda n: None)
+    cfg = Config()
+    cfg.transcribe_max_seconds = 300
+    b = mod.LocalBackend(cfg)
+    b._whisper = RecordingModel()
+    b.transcribe("/tmp/long-recording.mp3")
+    assert seen["path"] == "/tmp/long-recording.mp3"
+    assert seen["clip_timestamps"] == [0.0, 300.0]
